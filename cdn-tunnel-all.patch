@@ -1,0 +1,4622 @@
+diff --git a/README.md b/README.md
+index d497a2a..a57ae63 100644
+--- a/README.md
++++ b/README.md
+@@ -164,6 +164,11 @@ curl -s -H "X-Tunnel-Auth: мастер" "http://127.0.0.1/admin/link/new?label=
+ | `-device` | отпечаток устройства для привязки ссылки (по умолчанию сам) |
+ | `-share` | напечатать ссылку `cdn://…` с текущими настройками и выйти |
+ | `-stats` | машиночитаемый вывод `STATS ...` (для Android-обёртки) |
++| `-require-e2e` | сервер: принимать только клиентов со сквозным шифрованием (нужен `-password`); остальным — 404 |
++| `-legacy` | клиент: без сквозного шифрования (совместимость со старым сервером; ключ/ссылка идут в заголовках) |
++| `-tls-fingerprint` | клиент: TLS-отпечаток к CDN — `chrome` (по умолч.), `firefox`, `safari`, `ios`, `edge`, `android`, `random`, `go` (обычный TLS Go, старое поведение) |
++| `-allow-private` | сервер: разрешить ссылкам ходить в loopback/частные сети сервера (по умолчанию только владельцу) |
++| `-admin-remote` | сервер: пускать `/admin` не только с localhost |
+ 
+ ## Зачем серверу `-password`, если есть ссылки
+ `-password` — это **мастер-ключ сервера**, а не «ещё один пароль для друга»:
+@@ -179,27 +184,82 @@ curl -s -H "X-Tunnel-Auth: мастер" "http://127.0.0.1/admin/link/new?label=
+ 
+ ## Транспорт и безопасность
+ - TLS есть только на участке **клиент → CDN**; CDN → origin — обычный HTTP:80.
++  Поэтому поверх HTTP работает **сквозное шифрование клиент↔origin** (по умолчанию
++  у клиента): CDN видит только шифртекст, а мастер-ключ и ссылка по сети вообще не
++  ходят.
++  - Рукопожатие: эфемерный X25519 + общий секрет (PSK), который не покидает
++    устройство: у владельца он выводится из `-password` (PBKDF2), у ссылки — из её
++    подписи. Ключи `c2s`/`s2c` = HKDF(X25519 ‖ PSK, транскрипт): forward secrecy и
++    взаимная аутентификация. Метка времени + одноразовый nonce защищают от повтора;
++    часы клиента не должны расходиться с сервером больше чем на 2 минуты.
++  - Данные: AES-256-GCM, у каждого стрима и направления свой подключ; в nonce
++    счётчик (seq чанка / номер записи), поэтому подмена, перестановка и повтор
++    записей отбрасываются.
++  - Слабый `-password` можно перебирать офлайн по записанному рукопожатию — берите
++    длинный случайный ключ. Ссылки (128-битная подпись) от этого не страдают.
++  - Сервер по умолчанию принимает и старых клиентов (без E2E); чтобы закрыть их,
++    запустите сервер с `-require-e2e`. Без `-password` E2E невозможно.
++  - Сессия живёт, пока клиент активен (15 минут простоя); после рестарта сервера
++    клиент договаривается заново, открытые в тот момент соединения рвутся.
+ - Доступ решает одна проверка: мастер-ключ владельца либо ссылка из реестра.
+-  Всё остальное — **403**; любой путь, кроме `/`, закрыт.
++  Без верного ключа/подписи сервер отвечает **404** как обычный сайт; любой путь,
++  кроме `/`, закрыт. Перебор ключа банит адрес на 15 минут.
++- TLS-отпечаток клиента к CDN маскируется под настоящий браузер (uTLS,
++  `-tls-fingerprint`, по умолчанию Chrome): порядок расширений, наборов шифров
++  и кривых в ClientHello — как у реального Chrome, а не характерный для
++  Go-клиента. Один раз при старте согласуется ALPN (h2/http-1.1) — дальше все
++  соединения пула используют этот же протокол, каждое со своим TLS-рукопожатием
++  тем же отпечатком. Это отдельный от сквозного шифрования слой: uTLS прячет
++  форму TLS-рукопожатия от DPI/WAF перед CDN, а сквозное шифрование прячет
++  содержимое от самого CDN. Если проба отпечатка не удалась (редкая
++  несовместимость с конкретным CDN/сервером) — клиент один раз предупреждает и
++  тихо откатывается на обычный TLS Go, чтобы соединение вообще заработало.
+ - Реестр авторитетен: удалённая ссылка мертва навсегда, отозванная — до «Вернуть».
+   Подписи удостоверения самой по себе недостаточно.
+ - Ссылка `cdn://…` шифрует конфиг, но не заменяет пароль: у кого ссылка — у того
+   доступ к серверу, пока владелец её не закрыл. Делитесь ей осторожно.
+ - `stream`/WebSocket-полнодуплекс требует CDN, не буферизующего тело запроса.
++- Скачивание вниз переживает обрыв долгого GET (частое дело у буферизующих
++  CDN/с таймаутом): сервер держит последние ~4 МиБ отправленного в кольцевом
++  буфере и умеет отдать его заново с точной позиции (`/t/down?from=`), а
++  клиент сам переподключается (до 8 раз, с нарастающей паузой) и продолжает
++  ровно с того места, где оборвалось — без потери и без задвоения байт.
++  Если нужный диапазон уже вытеснен буфером (клиент отставал слишком долго),
++  сервер честно отвечает, что резюме невозможно, вместо того чтобы тихо
++  отдать не то. Отдельно: чанк, отправленный вверх, при сетевой ошибке или
++  5xx/429 повторяется тем же номером (до 4 раз) — сервер принимает повтор
++  идемпотентно; на 4xx-ошибках протокола (испорченные данные, лимиты) клиент
++  не повторяет и сразу сообщает об ошибке.
++- Половинное закрытие: когда локальное приложение закончило слать (например,
++  дочитало HTTP-запрос), сервер закрывает запись в целевое соединение (TCP
++  FIN), не трогая чтение — цель может успеть ответить, и это не обрывает
++  получение ответа. Под сквозным шифрованием сам факт «вверх больше ничего
++  не будет» подписан тем же ключом, что и данные: подделать его или снять с
++  чужого запроса, не зная ключа, нельзя.
++- Полноценный мультиплекс многих логических стримов в одной HTTP/2-сессии
++  (вместо отдельного X25519-рукопожатия на каждое TCP-соединение SOCKS) в
++  протокол пока не входит — это отдельная, более крупная переделка формата
++  кадров, а не улучшение поверх текущего транспорта.
+ 
+ ## Android-приложение
+-Весь трафик телефона идёт через туннель (`VpnService` + tun2socks → локальный
+-SOCKS5 → CDN). Готовый APK — в [Releases](../../releases), подробности сборки и
+-внутренностей — в [`android/README.md`](android/README.md). Проверено на
+-Android 14 (arm64).
++По умолчанию весь трафик телефона идёт через туннель (`VpnService` + tun2socks →
++локальный SOCKS5 → CDN), но это настраивается — см. «Приложения в туннеле» ниже.
++Готовый APK — в [Releases](../../releases), подробности сборки и внутренностей —
++в [`android/README.md`](android/README.md). Проверено на Android 14 (arm64).
+ 
+ **Вкладки**
+ 
+ - **Туннель** — поле `cdn://…` с кнопками «Импортировать» / «Из буфера», строка
+-  с текущим сервером и кнопка запуска. Всё остальное (IP, Host, мастер-ключ,
+-  порт, conns, транспорт, метод, UDP, DNS, MTU, Fast Open) — в свёрнутой
+-  «Ручной настройке», там же «Стереть все настройки». Ссылку можно просто
+-  открыть из мессенджера: приложение ловит схему `cdn://`.
++  с текущим сервером, кнопка **«Приложения в туннеле»** и кнопка запуска. Всё
++  остальное (IP, Host, мастер-ключ, порт, conns, транспорт, метод, UDP, DNS,
++  MTU, Fast Open) — в свёрнутой «Ручной настройке», там же «Стереть все
++  настройки». Ссылку можно просто открыть из мессенджера: приложение ловит
++  схему `cdn://`.
++- **Приложения в туннеле** — три режима: «Все» (как раньше), «Только выбранные»
++  (в VPN идут только отмеченные приложения, у остальных обычный интернет) и
++  «Кроме выбранных» (наоборот). Список — установленные запускаемые приложения
++  с иконкой и поиском; выбор действует со следующего запуска VPN. Свой трафик
++  клиента к CDN всегда идёт в обход туннеля независимо от режима.
+ - **Сервер** — автодеплой на VPS по SSH (systemd, автозапуск при ребуте),
+   мастер-ключ, `-addr`, метод, периодический рестарт; кнопки «Развернуть»,
+   «Статус», «Удалить с сервера» и **«Управление сервером»**.
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 3e6a57c..9d74b50 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -6,6 +6,15 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+ 
++    <!-- Без этого на Android 11+ PackageManager не увидит чужие запускаемые
++         приложения — экран выбора «Приложения в туннеле» останется пустым. -->
++    <queries>
++        <intent>
++            <action android:name="android.intent.action.MAIN" />
++            <category android:name="android.intent.category.LAUNCHER" />
++        </intent>
++    </queries>
++
+     <application
+         android:allowBackup="true"
+         android:icon="@mipmap/ic_launcher"
+@@ -38,6 +47,12 @@
+             android:label="Управление сервером"
+             android:parentActivityName=".MainActivity" />
+ 
++        <activity
++            android:name=".AppSelectionActivity"
++            android:exported="false"
++            android:label="Приложения в туннеле"
++            android:parentActivityName=".MainActivity" />
++
+         <service
+             android:name=".TunVpnService"
+             android:exported="false"
+diff --git a/android/app/src/main/java/com/cdn/vpn/AppSelectionActivity.java b/android/app/src/main/java/com/cdn/vpn/AppSelectionActivity.java
+new file mode 100644
+index 0000000..4587b78
+--- /dev/null
++++ b/android/app/src/main/java/com/cdn/vpn/AppSelectionActivity.java
+@@ -0,0 +1,228 @@
++package com.cdn.vpn;
++
++import android.content.Intent;
++import android.content.pm.ApplicationInfo;
++import android.content.pm.PackageManager;
++import android.content.pm.ResolveInfo;
++import android.graphics.drawable.Drawable;
++import android.os.AsyncTask;
++import android.os.Bundle;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.ArrayAdapter;
++import android.widget.CheckBox;
++import android.widget.EditText;
++import android.widget.Filter;
++import android.widget.Filterable;
++import android.widget.ImageView;
++import android.widget.ListView;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.appcompat.app.AppCompatActivity;
++
++import com.google.android.material.button.MaterialButton;
++import com.google.android.material.button.MaterialButtonToggleGroup;
++import com.google.android.material.progressindicator.LinearProgressIndicator;
++
++import java.text.Collator;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++
++/**
++ * Выбор приложений для туннеля: «Все», «Только выбранные» или «Все, кроме
++ * выбранных». Список показывает установленные приложения с иконкой лаунчера
++ * (только те, что можно запустить, — системные службы без своего значка в
++ * списке не нужны). Выбор действует со следующего запуска VPN.
++ */
++public class AppSelectionActivity extends AppCompatActivity {
++
++    /** Одна строка списка. */
++    private static class AppEntry {
++        String pkg, label;
++        Drawable icon;
++    }
++
++    private MaterialButtonToggleGroup group;
++    private MaterialButton btnAll, btnOnly, btnExcept;
++    private TextView tvHint;
++    private View searchBox;
++    private EditText etSearch;
++    private ListView list;
++    private LinearProgressIndicator progress;
++    private Adapter adapter;
++
++    private AppSelectionStore.Mode mode = AppSelectionStore.Mode.ALL;
++    private final Set<String> selected = new HashSet<>();
++    private List<AppEntry> all = new ArrayList<>();
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++        setContentView(R.layout.activity_app_selection);
++        setTitle("Приложения в туннеле");
++
++        group = findViewById(R.id.toggle_mode);
++        btnAll = findViewById(R.id.btn_mode_all);
++        btnOnly = findViewById(R.id.btn_mode_only);
++        btnExcept = findViewById(R.id.btn_mode_except);
++        tvHint = findViewById(R.id.tv_mode_hint);
++        searchBox = findViewById(R.id.til_search);
++        etSearch = findViewById(R.id.et_search);
++        list = findViewById(R.id.list_apps);
++        progress = findViewById(R.id.progress_apps);
++
++        AppSelectionStore store = AppSelectionStore.load(this);
++        mode = store.mode;
++        selected.addAll(store.packages);
++
++        group.addOnButtonCheckedListener((g, checkedId, isChecked) -> {
++            if (!isChecked) return;
++            if (checkedId == R.id.btn_mode_all) mode = AppSelectionStore.Mode.ALL;
++            else if (checkedId == R.id.btn_mode_only) mode = AppSelectionStore.Mode.ONLY;
++            else mode = AppSelectionStore.Mode.EXCEPT;
++            renderMode();
++        });
++        checkModeButton();
++        renderMode();
++
++        adapter = new Adapter();
++        list.setAdapter(adapter);
++        list.setOnItemClickListener((parent, v, position, id) -> {
++            AppEntry e = (AppEntry) adapter.getItem(position);
++            if (e == null) return;
++            if (selected.contains(e.pkg)) selected.remove(e.pkg); else selected.add(e.pkg);
++            CheckBox cb = v.findViewById(R.id.cb_app);
++            if (cb != null) cb.setChecked(selected.contains(e.pkg));
++        });
++        etSearch.addTextChangedListener(new android.text.TextWatcher() {
++            public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
++            public void onTextChanged(CharSequence s, int a, int b, int c) {}
++            public void afterTextChanged(android.text.Editable s) { adapter.getFilter().filter(s); }
++        });
++
++        loadApps();
++    }
++
++    @Override
++    protected void onPause() {
++        super.onPause();
++        AppSelectionStore store = new AppSelectionStore();
++        store.mode = mode;
++        store.packages = new HashSet<>(selected);
++        store.save(this);
++    }
++
++    private void checkModeButton() {
++        int id = mode == AppSelectionStore.Mode.ONLY ? R.id.btn_mode_only
++                : mode == AppSelectionStore.Mode.EXCEPT ? R.id.btn_mode_except : R.id.btn_mode_all;
++        group.check(id);
++    }
++
++    private void renderMode() {
++        boolean pick = mode != AppSelectionStore.Mode.ALL;
++        list.setVisibility(pick ? View.VISIBLE : View.GONE);
++        searchBox.setVisibility(pick ? View.VISIBLE : View.GONE);
++        switch (mode) {
++            case ONLY:
++                tvHint.setText("Через туннель пойдут только отмеченные приложения. Остальные будут работать через обычный интернет, в обход VPN.");
++                break;
++            case EXCEPT:
++                tvHint.setText("Через туннель пойдёт весь трафик, КРОМЕ отмеченных приложений — они будут работать в обход VPN.");
++                break;
++            default:
++                tvHint.setText("Через туннель идёт весь трафик устройства (как раньше). Собственный трафик приложения — всегда в обход VPN.");
++        }
++    }
++
++    /** Список приложений — тяжёлая операция (PackageManager), делаем в фоне. */
++    private void loadApps() {
++        progress.setVisibility(View.VISIBLE);
++        new AsyncTask<Void, Void, List<AppEntry>>() {
++            @Override protected List<AppEntry> doInBackground(Void... v) {
++                PackageManager pm = getPackageManager();
++                Intent launchable = new Intent(Intent.ACTION_MAIN);
++                launchable.addCategory(Intent.CATEGORY_LAUNCHER);
++                List<ResolveInfo> ri = pm.queryIntentActivities(launchable, 0);
++                List<AppEntry> out = new ArrayList<>();
++                String self = getPackageName();
++                Set<String> seen = new HashSet<>();
++                for (ResolveInfo r : ri) {
++                    ApplicationInfo ai = r.activityInfo.applicationInfo;
++                    if (ai.packageName.equals(self)) continue; // свой трафик и так всегда в обход
++                    if (!seen.add(ai.packageName)) continue;
++                    AppEntry e = new AppEntry();
++                    e.pkg = ai.packageName;
++                    e.label = String.valueOf(pm.getApplicationLabel(ai));
++                    try { e.icon = pm.getApplicationIcon(ai); } catch (Exception ignored) {}
++                    out.add(e);
++                }
++                Collator col = Collator.getInstance(Locale.getDefault());
++                out.sort((a, b) -> col.compare(a.label, b.label));
++                return out;
++            }
++            @Override protected void onPostExecute(List<AppEntry> result) {
++                if (isFinishing()) return;
++                all = result;
++                progress.setVisibility(View.GONE);
++                adapter.setData(all);
++                if (all.isEmpty()) {
++                    Toast.makeText(AppSelectionActivity.this, "Не удалось получить список приложений", Toast.LENGTH_SHORT).show();
++                }
++            }
++        }.execute();
++    }
++
++    /** Простой адаптер: иконка, название, пакет мельче под ним, чекбокс. */
++    private class Adapter extends android.widget.BaseAdapter implements Filterable {
++        private List<AppEntry> shown = new ArrayList<>();
++
++        void setData(List<AppEntry> data) { shown = data; notifyDataSetChanged(); }
++
++        @Override public int getCount() { return shown.size(); }
++        @Override public Object getItem(int i) { return shown.get(i); }
++        @Override public long getItemId(int i) { return i; }
++
++        @Override public View getView(int i, View convertView, ViewGroup parent) {
++            View v = convertView;
++            if (v == null) {
++                v = LayoutInflater.from(AppSelectionActivity.this).inflate(R.layout.item_app, parent, false);
++            }
++            AppEntry e = shown.get(i);
++            ((ImageView) v.findViewById(R.id.iv_icon)).setImageDrawable(e.icon);
++            ((TextView) v.findViewById(R.id.tv_label)).setText(e.label);
++            ((TextView) v.findViewById(R.id.tv_pkg)).setText(e.pkg);
++            ((CheckBox) v.findViewById(R.id.cb_app)).setChecked(selected.contains(e.pkg));
++            return v;
++        }
++
++        @Override public Filter getFilter() {
++            return new Filter() {
++                @Override protected FilterResults performFiltering(CharSequence q) {
++                    String needle = q == null ? "" : q.toString().trim().toLowerCase(Locale.getDefault());
++                    List<AppEntry> out = new ArrayList<>();
++                    for (AppEntry e : all) {
++                        if (needle.isEmpty()
++                                || e.label.toLowerCase(Locale.getDefault()).contains(needle)
++                                || e.pkg.toLowerCase(Locale.getDefault()).contains(needle)) {
++                            out.add(e);
++                        }
++                    }
++                    FilterResults r = new FilterResults();
++                    r.values = out;
++                    r.count = out.size();
++                    return r;
++                }
++                @SuppressWarnings("unchecked")
++                @Override protected void publishResults(CharSequence q, FilterResults r) {
++                    shown = (List<AppEntry>) r.values;
++                    notifyDataSetChanged();
++                }
++            };
++        }
++    }
++}
+diff --git a/android/app/src/main/java/com/cdn/vpn/AppSelectionStore.java b/android/app/src/main/java/com/cdn/vpn/AppSelectionStore.java
+new file mode 100644
+index 0000000..fb65c1e
+--- /dev/null
++++ b/android/app/src/main/java/com/cdn/vpn/AppSelectionStore.java
+@@ -0,0 +1,53 @@
++package com.cdn.vpn;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++import java.util.HashSet;
++import java.util.Set;
++
++/**
++ * Какие приложения гонять через туннель. Три режима:
++ *   ALL     — как раньше, весь трафик устройства (кроме самого клиента);
++ *   ONLY    — в туннель идут ТОЛЬКО выбранные приложения, у остальных обычный интернет;
++ *   EXCEPT  — в туннель идёт всё, КРОМЕ выбранных (они работают в обход VPN).
++ *
++ * Список хранит имена пакетов (например "com.android.chrome"), а не отображаемые
++ * названия — они не меняются при переустановке/обновлении приложения.
++ */
++public class AppSelectionStore {
++
++    public enum Mode { ALL, ONLY, EXCEPT }
++
++    private static final String PREFS = "cdntunnel_apps";
++    private static final String KEY_MODE = "mode";
++    private static final String KEY_PKGS = "packages";
++
++    public Mode mode = Mode.ALL;
++    public Set<String> packages = new HashSet<>();
++
++    public static AppSelectionStore load(Context ctx) {
++        SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
++        AppSelectionStore s = new AppSelectionStore();
++        String m = p.getString(KEY_MODE, Mode.ALL.name());
++        try { s.mode = Mode.valueOf(m); } catch (IllegalArgumentException ignored) { s.mode = Mode.ALL; }
++        s.packages = new HashSet<>(p.getStringSet(KEY_PKGS, new HashSet<>()));
++        return s;
++    }
++
++    public void save(Context ctx) {
++        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
++                .putString(KEY_MODE, mode.name())
++                .putStringSet(KEY_PKGS, packages)
++                .apply();
++    }
++
++    /** Короткая подпись для кнопки на главном экране. */
++    public String summary() {
++        switch (mode) {
++            case ONLY:   return "только выбранные (" + packages.size() + ")";
++            case EXCEPT: return "все, кроме " + packages.size();
++            default:     return "все";
++        }
++    }
++}
+diff --git a/android/app/src/main/java/com/cdn/vpn/MainActivity.java b/android/app/src/main/java/com/cdn/vpn/MainActivity.java
+index daa6d84..e5e3a70 100644
+--- a/android/app/src/main/java/com/cdn/vpn/MainActivity.java
++++ b/android/app/src/main/java/com/cdn/vpn/MainActivity.java
+@@ -41,7 +41,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
+     private MaterialButton btnToggle, btnClear;
+     private TextView tvStatus, tvStatusDetail, tvConn, tvLog, chevAdvanced, chevManual;
+     private TextView tvProfile;
+-    private MaterialButton btnImport, btnPaste, btnWipe;
++    private MaterialButton btnImport, btnPaste, btnWipe, btnAppSelect;
+     private TextView tvDownTotal, tvDownRate, tvUpTotal, tvUpRate, tvConns, tvUdp, tvRtt;
+     private LinearProgressIndicator progress;
+     private NestedScrollView logScroll;
+@@ -90,6 +90,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
+         btnImport = findViewById(R.id.btn_import);
+         btnPaste = findViewById(R.id.btn_paste);
+         btnWipe = findViewById(R.id.btn_wipe);
++        btnAppSelect = findViewById(R.id.btn_app_select);
+ 
+         tvDownTotal = findViewById(R.id.tv_down_total);
+         tvDownRate = findViewById(R.id.tv_down_rate);
+@@ -144,6 +145,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
+         btnImport.setOnClickListener(v -> importLink(etLink.getText() == null ? "" : etLink.getText().toString()));
+         btnPaste.setOnClickListener(v -> pasteLink());
+         btnWipe.setOnClickListener(v -> wipeAll());
++        btnAppSelect.setOnClickListener(v -> startActivity(new Intent(this, AppSelectionActivity.class)));
+         hdrManual.setOnClickListener(v -> {
+             boolean show = boxManual.getVisibility() != View.VISIBLE;
+             boxManual.setVisibility(show ? View.VISIBLE : View.GONE);
+@@ -164,6 +166,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
+         onPhase(TunState.phase(), TunState.phaseDetail());
+         onRunningChanged(TunState.isRunning());
+         renderStats(TunState.stats());
++        btnAppSelect.setText("Приложения в туннеле: " + AppSelectionStore.load(this).summary());
+     }
+ 
+     @Override protected void onPause() {
+diff --git a/android/app/src/main/java/com/cdn/vpn/TunVpnService.java b/android/app/src/main/java/com/cdn/vpn/TunVpnService.java
+index cf42348..a34b1ec 100644
+--- a/android/app/src/main/java/com/cdn/vpn/TunVpnService.java
++++ b/android/app/src/main/java/com/cdn/vpn/TunVpnService.java
+@@ -119,12 +119,7 @@ public class TunVpnService extends VpnService {
+             if (cfg.dns != null && !cfg.dns.isEmpty()) {
+                 b.addDnsServer(cfg.dns);
+             }
+-            // Наш собственный трафик (клиент туннеля к CDN) должен идти в обход VPN.
+-            try {
+-                b.addDisallowedApplication(getPackageName());
+-            } catch (Exception e) {
+-                TunState.log("[svc] disallow self не удался: " + e.getMessage());
+-            }
++            applyAppSelection(b);
+             b.setBlocking(false);
+ 
+             vpnPfd = b.establish();
+@@ -153,6 +148,51 @@ public class TunVpnService extends VpnService {
+         }
+     }
+ 
++    /**
++     * Применяет выбор пользователя (экран «Приложения в туннеле») к builder'у TUN.
++     * Наш собственный трафик (клиент к CDN) всегда идёт в обход VPN — либо явным
++     * disallow, либо тем, что в режиме ONLY мы его просто никогда не add'им.
++     * addAllowedApplication и addDisallowedApplication нельзя смешивать — Android
++     * разрешает только один список на интерфейс, поэтому режимы взаимоисключающие.
++     */
++    private void applyAppSelection(Builder b) {
++        AppSelectionStore sel = AppSelectionStore.load(this);
++        String self = getPackageName();
++        if (sel.mode == AppSelectionStore.Mode.ALL || sel.packages.isEmpty()) {
++            if (sel.mode != AppSelectionStore.Mode.ALL) {
++                TunState.log("[svc] список приложений пуст — веду весь трафик, как в режиме «Все»");
++            }
++            try {
++                b.addDisallowedApplication(self);
++            } catch (Exception e) {
++                TunState.log("[svc] disallow self не удался: " + e.getMessage());
++            }
++            return;
++        }
++        int ok = 0;
++        for (String pkg : sel.packages) {
++            if (pkg.equals(self)) continue; // свой пакет и так не участвует
++            try {
++                if (sel.mode == AppSelectionStore.Mode.ONLY) b.addAllowedApplication(pkg);
++                else b.addDisallowedApplication(pkg);
++                ok++;
++            } catch (android.content.pm.PackageManager.NameNotFoundException e) {
++                TunState.log("[svc] приложение " + pkg + " не найдено (удалено?) — пропускаю");
++            }
++        }
++        if (sel.mode == AppSelectionStore.Mode.EXCEPT) {
++            try {
++                b.addDisallowedApplication(self);
++            } catch (Exception e) {
++                TunState.log("[svc] disallow self не удался: " + e.getMessage());
++            }
++        }
++        TunState.log("[svc] режим приложений: " + sel.mode + ", в списке " + ok + " из " + sel.packages.size());
++        if (sel.mode == AppSelectionStore.Mode.ONLY && ok == 0) {
++            TunState.log("[svc] ⚠ ни одно выбранное приложение не найдено — через туннель не пойдёт ничего, кроме системного трафика");
++        }
++    }
++
+     private void startProber() {
+         prober = new Thread(() -> {
+             int fails = 0;
+diff --git a/android/app/src/main/res/layout/activity_app_selection.xml b/android/app/src/main/res/layout/activity_app_selection.xml
+new file mode 100644
+index 0000000..b1b9f4f
+--- /dev/null
++++ b/android/app/src/main/res/layout/activity_app_selection.xml
+@@ -0,0 +1,75 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:orientation="vertical"
++    android:padding="16dp">
++
++    <com.google.android.material.button.MaterialButtonToggleGroup
++        android:id="@+id/toggle_mode"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        app:singleSelection="true"
++        app:selectionRequired="true">
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/btn_mode_all"
++            style="@style/Widget.Material3.Button.OutlinedButton"
++            android:layout_width="0dp" android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:text="Все" />
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/btn_mode_only"
++            style="@style/Widget.Material3.Button.OutlinedButton"
++            android:layout_width="0dp" android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:text="Только выбранные" />
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/btn_mode_except"
++            style="@style/Widget.Material3.Button.OutlinedButton"
++            android:layout_width="0dp" android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:text="Кроме выбранных" />
++    </com.google.android.material.button.MaterialButtonToggleGroup>
++
++    <TextView
++        android:id="@+id/tv_mode_hint"
++        android:layout_width="match_parent" android:layout_height="wrap_content"
++        android:layout_marginTop="10dp"
++        android:textSize="12sp"
++        android:textColor="?attr/colorOnSurfaceVariant"
++        android:text="Через туннель идёт весь трафик устройства." />
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/til_search"
++        android:layout_width="match_parent" android:layout_height="wrap_content"
++        android:layout_marginTop="10dp"
++        android:visibility="gone"
++        style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/et_search"
++            android:layout_width="match_parent" android:layout_height="wrap_content"
++            android:hint="Поиск по названию или пакету"
++            android:inputType="text"
++            android:visibility="visible" />
++    </com.google.android.material.textfield.TextInputLayout>
++
++    <com.google.android.material.progressindicator.LinearProgressIndicator
++        android:id="@+id/progress_apps"
++        android:layout_width="match_parent" android:layout_height="wrap_content"
++        android:layout_marginTop="8dp"
++        android:indeterminate="true"
++        android:visibility="gone" />
++
++    <ListView
++        android:id="@+id/list_apps"
++        android:layout_width="match_parent" android:layout_height="0dp"
++        android:layout_weight="1"
++        android:layout_marginTop="8dp"
++        android:divider="@null"
++        android:visibility="gone" />
++
++</LinearLayout>
+diff --git a/android/app/src/main/res/layout/activity_main.xml b/android/app/src/main/res/layout/activity_main.xml
+index 63d3568..0321b90 100644
+--- a/android/app/src/main/res/layout/activity_main.xml
++++ b/android/app/src/main/res/layout/activity_main.xml
+@@ -107,6 +107,14 @@
+                     android:textColor="?attr/colorOnSurfaceVariant"
+                     android:paddingBottom="6dp" />
+ 
++                <com.google.android.material.button.MaterialButton
++                    android:id="@+id/btn_app_select"
++                    style="@style/Widget.Material3.Button.OutlinedButton"
++                    android:layout_width="match_parent" android:layout_height="48dp"
++                    android:layout_marginBottom="10dp"
++                    android:text="Приложения в туннеле: все"
++                    app:icon="@drawable/ic_tab_link" app:cornerRadius="14dp" />
++
+                 <!-- Ручная настройка (свёрнута: обычно хватает ссылки) -->
+                 <LinearLayout
+                     android:id="@+id/hdr_manual"
+diff --git a/android/app/src/main/res/layout/item_app.xml b/android/app/src/main/res/layout/item_app.xml
+new file mode 100644
+index 0000000..b0dc24a
+--- /dev/null
++++ b/android/app/src/main/res/layout/item_app.xml
+@@ -0,0 +1,40 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="horizontal"
++    android:gravity="center_vertical"
++    android:paddingVertical="10dp"
++    android:background="?attr/selectableItemBackground">
++
++    <ImageView
++        android:id="@+id/iv_icon"
++        android:layout_width="36dp" android:layout_height="36dp"
++        android:layout_marginEnd="14dp" />
++
++    <LinearLayout
++        android:layout_width="0dp" android:layout_height="wrap_content"
++        android:layout_weight="1"
++        android:orientation="vertical">
++
++        <TextView
++            android:id="@+id/tv_label"
++            android:layout_width="match_parent" android:layout_height="wrap_content"
++            android:textSize="15sp"
++            android:textColor="?attr/colorOnSurface"
++            android:maxLines="1" android:ellipsize="end" />
++
++        <TextView
++            android:id="@+id/tv_pkg"
++            android:layout_width="match_parent" android:layout_height="wrap_content"
++            android:textSize="11sp" android:fontFamily="monospace"
++            android:textColor="?attr/colorOnSurfaceVariant"
++            android:maxLines="1" android:ellipsize="end" />
++    </LinearLayout>
++
++    <CheckBox
++        android:id="@+id/cb_app"
++        android:layout_width="wrap_content" android:layout_height="wrap_content"
++        android:clickable="false" android:focusable="false" />
++
++</LinearLayout>
+diff --git a/e2e.go b/e2e.go
+new file mode 100644
+index 0000000..8c1b5bd
+--- /dev/null
++++ b/e2e.go
+@@ -0,0 +1,748 @@
++package main
++
++// Сквозное шифрование клиент↔origin поверх HTTP через CDN.
++//
++// Зачем: CDN терминирует TLS и без этого слоя видит мастер-ключ/ссылку в
++// заголовках, адреса назначения и весь трафик открытым текстом.
++//
++// Схема (аналог Noise NNpsk0 на примитивах стандартной библиотеки):
++//   - обе стороны знают секрет PSK, который НИКОГДА не ходит по сети:
++//     владелец — из мастер-пароля (PBKDF2), ссылка — из своей подписи cred;
++//   - клиент шлёт эфемерный X25519 + метку времени + nonce + MAC по PSK;
++//   - сервер проверяет MAC (значит, клиент знает PSK), отвечает своим
++//     эфемерным ключом и MAC по PSK (значит, сервер знает PSK);
++//   - ключи c2s/s2c = HKDF(X25519 || PSK, транскрипт): forward secrecy от
++//     эфемерных ключей, аутентификация обеих сторон от PSK;
++//   - дальше каждый стрим получает свои подключи, данные едут AES-256-GCM.
++//
++// Ограничение: PSK владельца получен из пароля, поэтому слабый пароль можно
++// перебирать офлайн по записанному рукопожатию. Берите длинный случайный
++// мастер-ключ; ссылки (128-битная подпись) от этого не страдают.
++
++import (
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/ecdh"
++	"crypto/hmac"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/subtle"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	kxHeader  = "X-Tunnel-Kx"  // «это рукопожатие E2E» (значение — версия)
++	sidHeader = "X-Tunnel-Sid" // идентификатор сессии (не секрет: без ключей он бесполезен)
++	kxVer     = 1
++
++	kxKindOwner = 0
++	kxKindLink  = 1
++
++	kxMaxSkew      = 2 * time.Minute
++	sessIdleTTL    = 15 * time.Minute
++	maxSessions    = 4096
++	maxSessPerKey  = 64
++	maxRecord      = 1<<20 + 16 // потолок записи вниз (защита клиента от чужой длины)
++	udpReplayBits  = 64
++	denyClock      = "clock skew"
++	pbkdf2Iter     = 100000
++	pskLabelOwner  = "cdn-tunnel/e2e/v1/owner"
++	pskLabelLink   = "cdn-tunnel/e2e/v1/link"
++	labelK0        = "cdn-tunnel/e2e/v1/k0"
++	sidBytes       = 16
++	nonceBytes     = 16
++	x25519Len      = 32
++	macLen         = 32
++	kxClientPrefix = "cdn-tunnel/e2e/v1/c1"
++	kxServerPrefix = "cdn-tunnel/e2e/v1/s1"
++)
++
++// Настройки режима (флаги).
++var (
++	requireE2E   bool // сервер: отвергать запросы без E2E-сессии (-require-e2e)
++	clientLegacy bool // клиент: работать по-старому, без E2E (-legacy)
++)
++
++var errKx = errors.New("e2e: handshake failed")
++
++// clientNow — часы клиента для метки времени рукопожатия (подменяются в тестах).
++var clientNow = time.Now
++
++// ---------------------------------------------------------------- примитивы
++
++func hkdfExtract(salt, ikm []byte) []byte {
++	m := hmac.New(sha256.New, salt)
++	m.Write(ikm)
++	return m.Sum(nil)
++}
++
++func hkdfExpand(prk []byte, info string, n int) []byte {
++	var out, t []byte
++	for i := byte(1); len(out) < n; i++ {
++		m := hmac.New(sha256.New, prk)
++		m.Write(t)
++		m.Write([]byte(info))
++		m.Write([]byte{i})
++		t = m.Sum(nil)
++		out = append(out, t...)
++	}
++	return out[:n]
++}
++
++// pbkdf2 — PBKDF2-HMAC-SHA256 (в стандартной библиотеке нет до Go 1.24).
++func pbkdf2(pass, salt []byte, iter, n int) []byte {
++	var out []byte
++	for block := uint32(1); len(out) < n; block++ {
++		m := hmac.New(sha256.New, pass)
++		m.Write(salt)
++		var b [4]byte
++		binary.BigEndian.PutUint32(b[:], block)
++		m.Write(b[:])
++		u := m.Sum(nil)
++		t := append([]byte(nil), u...)
++		for i := 1; i < iter; i++ {
++			m = hmac.New(sha256.New, pass)
++			m.Write(u)
++			u = m.Sum(nil)
++			for j := range t {
++				t[j] ^= u[j]
++			}
++		}
++		out = append(out, t...)
++	}
++	return out[:n]
++}
++
++var (
++	pskMu    sync.Mutex
++	pskCache = map[string][]byte{}
++)
++
++// ownerPSK — секрет владельца из мастер-пароля (медленный KDF, результат кэшируется).
++func ownerPSK(master string) []byte {
++	pskMu.Lock()
++	defer pskMu.Unlock()
++	if k, ok := pskCache[master]; ok {
++		return k
++	}
++	k := pbkdf2([]byte(master), []byte(pskLabelOwner), pbkdf2Iter, 32)
++	pskCache[master] = k
++	return k
++}
++
++// linkPSK — секрет ссылки из её подписи (128 бит энтропии, KDF не нужен).
++func linkPSK(mac string) []byte {
++	m := hmac.New(sha256.New, []byte(mac))
++	m.Write([]byte(pskLabelLink))
++	return m.Sum(nil)
++}
++
++func newGCM(key []byte) cipher.AEAD {
++	b, err := aes.NewCipher(key)
++	if err != nil {
++		panic(err)
++	}
++	g, err := cipher.NewGCM(b)
++	if err != nil {
++		panic(err)
++	}
++	return g
++}
++
++// subAEAD — подключ под метку: у каждого стрима/направления/назначения свой.
++func subAEAD(base []byte, label string) cipher.AEAD {
++	return newGCM(hkdfExpand(base, label, 32))
++}
++
++// nonceFor — 96-битный nonce из 64-битного счётчика. Уникальность гарантируется
++// тем, что под каждым подключом счётчик никогда не повторяется.
++func nonceFor(ctr uint64) []byte {
++	n := make([]byte, 12)
++	binary.BigEndian.PutUint64(n[4:], ctr)
++	return n
++}
++
++// ---------------------------------------------------------------- записи
++
++// sealReader превращает поток в последовательность записей [len u32][ct].
++type sealReader struct {
++	r    io.Reader
++	aead cipher.AEAD
++	aad  []byte
++	ctr  uint64
++	pend []byte
++	tmp  []byte
++	err  error
++}
++
++func newSealReader(r io.Reader, a cipher.AEAD, aad string) *sealReader {
++	return &sealReader{r: r, aead: a, aad: []byte(aad), tmp: make([]byte, 16*1024)}
++}
++
++func (s *sealReader) Read(p []byte) (int, error) {
++	for len(s.pend) == 0 {
++		if s.err != nil {
++			return 0, s.err
++		}
++		n, err := s.r.Read(s.tmp)
++		s.err = err
++		if n > 0 {
++			s.pend = sealRecord(s.aead, s.ctr, s.aad, s.tmp[:n])
++			s.ctr++
++		}
++	}
++	n := copy(p, s.pend)
++	s.pend = s.pend[n:]
++	return n, nil
++}
++
++func sealRecord(a cipher.AEAD, ctr uint64, aad, pt []byte) []byte {
++	out := make([]byte, 4, 4+len(pt)+a.Overhead())
++	out = a.Seal(out, nonceFor(ctr), pt, aad)
++	binary.BigEndian.PutUint32(out[:4], uint32(len(out)-4))
++	return out
++}
++
++// openReader читает записи [len u32][ct] и отдаёт открытый текст.
++type openReader struct {
++	r        io.Reader
++	aead     cipher.AEAD
++	aad      []byte
++	ctr      uint64
++	pend     []byte
++	consumed uint64 // байт прочитано из r ЦЕЛЫМИ записями — точка для resume
++}
++
++// Consumed — сколько байт нижележащего потока разобрано в полные, успешно
++// расшифрованные записи. Используется клиентом для возобновления down-GET
++// с точной границы записи после обрыва (см. relayDown в reliability.go).
++func (o *openReader) Consumed() uint64 { return o.consumed }
++
++func newOpenReader(r io.Reader, a cipher.AEAD, aad string) *openReader {
++	return &openReader{r: r, aead: a, aad: []byte(aad)}
++}
++
++func (o *openReader) Read(p []byte) (int, error) {
++	for len(o.pend) == 0 {
++		var h [4]byte
++		if _, err := io.ReadFull(o.r, h[:]); err != nil {
++			return 0, err
++		}
++		n := binary.BigEndian.Uint32(h[:])
++		if n < uint32(o.aead.Overhead()) || n > maxRecord {
++			return 0, errors.New("e2e: bad record length")
++		}
++		ct := make([]byte, n)
++		if _, err := io.ReadFull(o.r, ct); err != nil {
++			return 0, err
++		}
++		pt, err := o.aead.Open(nil, nonceFor(o.ctr), ct, o.aad)
++		if err != nil {
++			return 0, errors.New("e2e: record authentication failed")
++		}
++		o.ctr++
++		o.consumed += uint64(len(h) + len(ct))
++		o.pend = pt
++	}
++	n := copy(p, o.pend)
++	o.pend = o.pend[n:]
++	return n, nil
++}
++
++// ---------------------------------------------------------------- сессия
++
++// streamKeys — подключи одного TCP-стрима (одинаково выводятся с обеих сторон).
++type streamKeys struct {
++	connect cipher.AEAD // c2s: цель connect (nonce 0)
++	up      cipher.AEAD // c2s: чанки chunked-режима (nonce = seq)
++	ups     cipher.AEAD // c2s: записи потокового апстрима
++	down    cipher.AEAD // s2c: записи вниз
++	id      string
++}
++
++func deriveStreamKeys(c2s, s2c []byte, id string) *streamKeys {
++	return &streamKeys{
++		id:      id,
++		connect: subAEAD(c2s, "cn|"+id),
++		up:      subAEAD(c2s, "up|"+id),
++		ups:     subAEAD(c2s, "ups|"+id),
++		down:    subAEAD(s2c, "dn|"+id),
++	}
++}
++
++// upAAD различает обычный чанк и маркер конца загрузки (eof=true) — иначе
++// узел на пути мог бы просто дописать "&eof=1" в URL уже подписанного
++// запроса и оборвать чужую загрузку раньше времени без знания ключа.
++func upAAD(id string, seq uint64, eof bool) []byte {
++	if eof {
++		return []byte(fmt.Sprintf("up|%s|%d|eof", id, seq))
++	}
++	return []byte(fmt.Sprintf("up|%s|%d", id, seq))
++}
++
++// udpKeys — подключи UDP-сессии.
++type udpKeys struct {
++	up   cipher.AEAD // c2s: пачки датаграмм (nonce = счётчик пачки)
++	down cipher.AEAD // s2c: записи вниз
++	id   string
++}
++
++func deriveUDPKeys(c2s, s2c []byte, id string) *udpKeys {
++	return &udpKeys{id: id, up: subAEAD(c2s, "uu|"+id), down: subAEAD(s2c, "ud|"+id)}
++}
++
++// replayWindow — скользящее окно принятых счётчиков (UDP-пачки приходят вразнобой).
++type replayWindow struct {
++	mu   sync.Mutex
++	max  uint64
++	bits uint64
++	init bool
++}
++
++func (w *replayWindow) accept(c uint64) bool {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	if !w.init {
++		w.init, w.max, w.bits = true, c, 1
++		return true
++	}
++	switch {
++	case c > w.max:
++		shift := c - w.max
++		if shift >= udpReplayBits {
++			w.bits = 1
++		} else {
++			w.bits = w.bits<<shift | 1
++		}
++		w.max = c
++		return true
++	case w.max-c >= udpReplayBits:
++		return false
++	default:
++		bit := uint64(1) << (w.max - c)
++		if w.bits&bit != 0 {
++			return false
++		}
++		w.bits |= bit
++		return true
++	}
++}
++
++// ---------------------------------------------------------------- сервер
++
++// e2eSession — состояние одной сессии на сервере.
++type e2eSession struct {
++	sid      string
++	c2s, s2c []byte
++	owner    bool
++	linkID   string
++	device   string
++	created  time.Time
++	last     time.Time
++}
++
++func (s *e2eSession) billKey() string {
++	if s.owner {
++		return ownerKey
++	}
++	return s.linkID
++}
++
++type sessionStore struct {
++	mu     sync.Mutex
++	m      map[string]*e2eSession
++	nonces map[[nonceBytes]byte]time.Time
++}
++
++func newSessionStore() *sessionStore {
++	return &sessionStore{m: map[string]*e2eSession{}, nonces: map[[nonceBytes]byte]time.Time{}}
++}
++
++func (ss *sessionStore) get(sid string, now time.Time) *e2eSession {
++	ss.mu.Lock()
++	defer ss.mu.Unlock()
++	s := ss.m[sid]
++	if s == nil {
++		return nil
++	}
++	if now.Sub(s.last) > sessIdleTTL {
++		delete(ss.m, sid)
++		return nil
++	}
++	s.last = now
++	return s
++}
++
++// add заводит сессию; при переполнении вытесняет самые старые.
++func (ss *sessionStore) add(s *e2eSession, now time.Time) {
++	ss.mu.Lock()
++	defer ss.mu.Unlock()
++	perKey, oldest := 0, (*e2eSession)(nil)
++	for id, o := range ss.m {
++		if now.Sub(o.last) > sessIdleTTL {
++			delete(ss.m, id)
++			continue
++		}
++		if o.billKey() == s.billKey() {
++			perKey++
++			if oldest == nil || o.last.Before(oldest.last) {
++				oldest = o
++			}
++		}
++	}
++	if perKey >= maxSessPerKey && oldest != nil {
++		delete(ss.m, oldest.sid)
++	}
++	if len(ss.m) >= maxSessions {
++		var old *e2eSession
++		for _, o := range ss.m {
++			if old == nil || o.last.Before(old.last) {
++				old = o
++			}
++		}
++		if old != nil {
++			delete(ss.m, old.sid)
++		}
++	}
++	s.created, s.last = now, now
++	ss.m[s.sid] = s
++}
++
++// fresh запоминает nonce клиента; повтор внутри окна — replay.
++func (ss *sessionStore) fresh(n [nonceBytes]byte, now time.Time) bool {
++	ss.mu.Lock()
++	defer ss.mu.Unlock()
++	for k, t := range ss.nonces {
++		if now.Sub(t) > 2*kxMaxSkew+time.Minute {
++			delete(ss.nonces, k)
++		}
++	}
++	if _, dup := ss.nonces[n]; dup {
++		return false
++	}
++	if len(ss.nonces) > 100000 {
++		return false
++	}
++	ss.nonces[n] = now
++	return true
++}
++
++type ctxKey struct{}
++
++func sessFrom(r *http.Request) *e2eSession {
++	s, _ := r.Context().Value(ctxKey{}).(*e2eSession)
++	return s
++}
++
++func withSess(r *http.Request, s *e2eSession) *http.Request {
++	return r.WithContext(context.WithValue(r.Context(), ctxKey{}, s))
++}
++
++// parsedHello — разобранное сообщение клиента.
++type parsedHello struct {
++	kind   byte
++	id     string
++	cEph   []byte
++	nc     [nonceBytes]byte
++	ts     int64
++	enc    []byte
++	mac    []byte
++	signed []byte // всё, что покрыто MAC
++	raw    []byte
++}
++
++func parseClientHello(b []byte) (*parsedHello, error) {
++	// ver kind idLen id cEph nc ts encLen enc mac
++	if len(b) < 3 || b[0] != kxVer {
++		return nil, errKx
++	}
++	h := &parsedHello{kind: b[1], raw: b}
++	il := int(b[2])
++	off := 3
++	if len(b) < off+il+x25519Len+nonceBytes+8+2+macLen {
++		return nil, errKx
++	}
++	h.id = string(b[off : off+il])
++	off += il
++	h.cEph = b[off : off+x25519Len]
++	off += x25519Len
++	copy(h.nc[:], b[off:off+nonceBytes])
++	off += nonceBytes
++	h.ts = int64(binary.BigEndian.Uint64(b[off : off+8]))
++	off += 8
++	el := int(binary.BigEndian.Uint16(b[off : off+2]))
++	off += 2
++	if len(b) != off+el+macLen {
++		return nil, errKx
++	}
++	h.enc = b[off : off+el]
++	off += el
++	h.signed = b[:off]
++	h.mac = b[off:]
++	return h, nil
++}
++
++func kxMAC(psk []byte, prefix string, parts ...[]byte) []byte {
++	m := hmac.New(sha256.New, psk)
++	m.Write([]byte(prefix))
++	for _, p := range parts {
++		m.Write(p)
++	}
++	return m.Sum(nil)
++}
++
++// k0 — ключ «предрукопожатия»: шифрует device клиента и причину отказа сервера.
++func k0(psk []byte, nc [nonceBytes]byte) cipher.AEAD {
++	return newGCM(hkdfExpand(hkdfExtract(nc[:], psk), labelK0, 32))
++}
++
++// handleKx обрабатывает POST/GET /hello с заголовком X-Tunnel-Kx.
++func (g *linkGate) handleKx(w http.ResponseWriter, r *http.Request) {
++	fail := func() { g.guard.fail(limiterKey(r), time.Now()); http.NotFound(w, r) }
++	if authToken == "" || !methodAllowed(r) {
++		http.NotFound(w, r) // без мастер-ключа нет общего секрета
++		return
++	}
++	raw, err := readPayload(r, qToken)
++	if err != nil {
++		fail()
++		return
++	}
++	h, err := parseClientHello(raw)
++	if err != nil {
++		fail()
++		return
++	}
++	var psk []byte
++	switch h.kind {
++	case kxKindOwner:
++		psk = ownerPSK(authToken)
++	case kxKindLink:
++		psk = linkPSK(credMAC(authToken, h.id))
++	default:
++		fail()
++		return
++	}
++	// 1) клиент обязан знать PSK — иначе неотличимо от чужого сайта.
++	if !hmac.Equal(h.mac, kxMAC(psk, kxClientPrefix, h.signed)) {
++		fail()
++		return
++	}
++	g.guard.reset(limiterKey(r))
++	now := time.Now()
++	k := k0(psk, h.nc)
++	reply := func(reason string) { // отказ для владельца PSK: причина шифруется
++		ct := k.Seal(nil, nonceFor(1), []byte(reason), h.mac)
++		w.Header().Set("Content-Type", "application/octet-stream")
++		w.WriteHeader(http.StatusForbidden)
++		w.Write(ct)
++	}
++	// 2) свежесть: метка времени и одноразовость nonce.
++	if d := now.Sub(time.Unix(h.ts, 0)); d > kxMaxSkew || d < -kxMaxSkew {
++		reply(denyClock)
++		return
++	}
++	if !g.sess.fresh(h.nc, now) {
++		fail() // повтор чужого рукопожатия
++		return
++	}
++	// 3) устройство клиента (зашифровано под k0).
++	device := ""
++	if len(h.enc) > 0 {
++		pt, err := k.Open(nil, nonceFor(0), h.enc, h.signed[:3+len(h.id)])
++		if err != nil {
++			fail()
++			return
++		}
++		device = string(pt)
++	}
++	// 4) реестр ссылок — последнее слово за ним.
++	sess := &e2eSession{owner: h.kind == kxKindOwner, linkID: h.id, device: device}
++	if sess.owner {
++		g.seen(ownerKey, clientIP(r))
++	} else if _, ok, why := g.useLink(h.id, device, clientIP(r)); !ok {
++		reply(why)
++		return
++	}
++	// 5) ответ сервера и ключи.
++	curve := ecdh.X25519()
++	sPriv, err := curve.GenerateKey(rand.Reader)
++	if err != nil {
++		http.Error(w, "internal", http.StatusInternalServerError)
++		return
++	}
++	cPub, err := curve.NewPublicKey(h.cEph)
++	if err != nil {
++		fail()
++		return
++	}
++	dh, err := sPriv.ECDH(cPub)
++	if err != nil {
++		fail()
++		return
++	}
++	var ns [nonceBytes]byte
++	rand.Read(ns[:])
++	sidRaw := make([]byte, sidBytes)
++	rand.Read(sidRaw)
++	sess.sid = hex.EncodeToString(sidRaw)
++	sBody := append(append(append([]byte{}, sPriv.PublicKey().Bytes()...), ns[:]...), sidRaw...)
++	th := sha256.Sum256(append(append([]byte{}, h.raw...), sBody...))
++	prk := hkdfExtract(append(h.nc[:], ns[:]...), append(append([]byte{}, dh...), psk...))
++	sess.c2s = hkdfExpand(prk, "c2s|"+string(th[:]), 32)
++	sess.s2c = hkdfExpand(prk, "s2c|"+string(th[:]), 32)
++	mac := kxMAC(psk, kxServerPrefix, th[:])
++	g.sess.add(sess, now)
++	w.Header().Set("Content-Type", "application/octet-stream")
++	w.WriteHeader(http.StatusOK)
++	w.Write(append(sBody, mac...))
++}
++
++// ---------------------------------------------------------------- клиент
++
++// clientSession — состояние E2E-сессии на клиенте.
++type clientSession struct {
++	sid      string
++	c2s, s2c []byte
++}
++
++// kxDeny — отказ сервера при рукопожатии (причина расшифрована).
++type kxDeny struct{ reason string }
++
++func (d kxDeny) Error() string { return d.reason }
++
++// clientKx выполняет рукопожатие. psk и kind определяются заранее.
++func (tc *tunnelClient) clientKx(ctx context.Context) (*clientSession, error) {
++	var psk []byte
++	var kind byte
++	var id string
++	switch {
++	case linkCred != "":
++		i := strings.IndexByte(linkCred, '.')
++		if i <= 0 {
++			return nil, errors.New("некорректная ссылка (cred)")
++		}
++		kind, id, psk = kxKindLink, linkCred[:i], linkPSK(linkCred[i+1:])
++	case authToken != "":
++		kind, psk = kxKindOwner, ownerPSK(authToken)
++	default:
++		return nil, errors.New("для E2E нужен мастер-ключ (-password) или ссылка (-link/-cred)")
++	}
++	return tc.clientKxWith(ctx, kind, id, psk)
++}
++
++// clientKxWith — рукопожатие с заданными видом, id ссылки и PSK.
++func (tc *tunnelClient) clientKxWith(ctx context.Context, kind byte, id string, psk []byte) (*clientSession, error) {
++	curve := ecdh.X25519()
++	cPriv, err := curve.GenerateKey(rand.Reader)
++	if err != nil {
++		return nil, err
++	}
++	var nc [nonceBytes]byte
++	rand.Read(nc[:])
++	head := append([]byte{kxVer, kind, byte(len(id))}, id...)
++	k := k0(psk, nc)
++	var enc []byte
++	if deviceID != "" {
++		enc = k.Seal(nil, nonceFor(0), []byte(deviceID), head)
++	}
++	msg := append([]byte{}, head...)
++	msg = append(msg, cPriv.PublicKey().Bytes()...)
++	msg = append(msg, nc[:]...)
++	var ts [8]byte
++	binary.BigEndian.PutUint64(ts[:], uint64(clientNow().Unix()))
++	msg = append(msg, ts[:]...)
++	var el [2]byte
++	binary.BigEndian.PutUint16(el[:], uint16(len(enc)))
++	msg = append(msg, el[:]...)
++	msg = append(msg, enc...)
++	mac := kxMAC(psk, kxClientPrefix, msg)
++	full := append(append([]byte{}, msg...), mac...)
++
++	resp, err := tc.doKx(ctx, full)
++	if err != nil {
++		return nil, fmt.Errorf("сервер недоступен (%v)", err)
++	}
++	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
++	resp.Body.Close()
++	switch {
++	case resp.StatusCode == http.StatusForbidden:
++		pt, err := k.Open(nil, nonceFor(1), body, mac)
++		if err != nil {
++			return nil, errKx
++		}
++		return nil, kxDeny{string(pt)}
++	case resp.StatusCode != http.StatusOK:
++		return nil, fmt.Errorf("%w (статус %d): нет E2E на сервере или неверный ключ/ссылка", errKx, resp.StatusCode)
++	}
++	if len(body) != x25519Len+nonceBytes+sidBytes+macLen {
++		return nil, errKx
++	}
++	sEph, ns, sidRaw := body[:x25519Len], body[x25519Len:x25519Len+nonceBytes], body[x25519Len+nonceBytes:x25519Len+nonceBytes+sidBytes]
++	sBody := body[:x25519Len+nonceBytes+sidBytes]
++	th := sha256.Sum256(append(append([]byte{}, full...), sBody...))
++	if subtle.ConstantTimeCompare(body[len(sBody):], kxMAC(psk, kxServerPrefix, th[:])) != 1 {
++		return nil, fmt.Errorf("%w: сервер не доказал знание ключа", errKx)
++	}
++	sPub, err := curve.NewPublicKey(sEph)
++	if err != nil {
++		return nil, errKx
++	}
++	dh, err := cPriv.ECDH(sPub)
++	if err != nil {
++		return nil, errKx
++	}
++	prk := hkdfExtract(append(nc[:], ns...), append(append([]byte{}, dh...), psk...))
++	return &clientSession{
++		sid: hex.EncodeToString(sidRaw),
++		c2s: hkdfExpand(prk, "c2s|"+string(th[:]), 32),
++		s2c: hkdfExpand(prk, "s2c|"+string(th[:]), 32),
++	}, nil
++}
++
++// doKx шлёт сообщение рукопожатия тем же методом, что и остальной трафик.
++func (tc *tunnelClient) doKx(ctx context.Context, msg []byte) (*http.Response, error) {
++	return tc.doReqH(ctx, tc.pool[0], "/hello", nil, qToken, msg, map[string]string{kxHeader: fmt.Sprint(kxVer)})
++}
++
++// drop удаляет сессию (клиент попрощался).
++func (ss *sessionStore) drop(sid string) {
++	ss.mu.Lock()
++	delete(ss.m, sid)
++	ss.mu.Unlock()
++}
++
++// ---------------------------------------------------------------- клиент: данные
++
++// streamKeysFor — подключи стрима (nil в старом режиме).
++func (tc *tunnelClient) streamKeysFor(id string) *streamKeys {
++	if v, ok := tc.keys.Load(id); ok {
++		return v.(*streamKeys)
++	}
++	return nil
++}
++
++// wrapUp оборачивает исходящий поток стрим-режима в зашифрованные записи.
++func (tc *tunnelClient) wrapUp(id string, r io.Reader) io.Reader {
++	if k := tc.streamKeysFor(id); k != nil {
++		return newSealReader(r, k.ups, "ups|"+id)
++	}
++	return r
++}
++
++// wrapDown оборачивает входящий поток вниз в расшифровку записей.
++func (tc *tunnelClient) wrapDown(id string, r io.Reader) io.Reader {
++	if k := tc.streamKeysFor(id); k != nil {
++		return newOpenReader(r, k.down, "dn|"+id)
++	}
++	return r
++}
+diff --git a/e2e_test.go b/e2e_test.go
+new file mode 100644
+index 0000000..1d9c4b3
+--- /dev/null
++++ b/e2e_test.go
+@@ -0,0 +1,506 @@
++package main
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"encoding/hex"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// tap записывает всё, что «видит CDN»: URL, заголовки, тела запросов и ответов.
++type tap struct {
++	mu    sync.Mutex
++	all   bytes.Buffer
++	hello [][]byte // тела рукопожатий (для replay-теста)
++}
++
++func (tp *tap) add(b []byte) {
++	tp.mu.Lock()
++	tp.all.Write(b)
++	tp.mu.Unlock()
++}
++
++func (tp *tap) seen(sub []byte) bool {
++	tp.mu.Lock()
++	defer tp.mu.Unlock()
++	return bytes.Contains(tp.all.Bytes(), sub)
++}
++
++type tapWriter struct {
++	http.ResponseWriter
++	tp *tap
++}
++
++func (w tapWriter) Write(b []byte) (int, error) { w.tp.add(b); return w.ResponseWriter.Write(b) }
++func (w tapWriter) Flush() {
++	if f, ok := w.ResponseWriter.(http.Flusher); ok {
++		f.Flush()
++	}
++}
++
++type tapReader struct {
++	io.ReadCloser
++	tp    *tap
++	hello bool
++	buf   bytes.Buffer
++}
++
++func (r *tapReader) Read(p []byte) (int, error) {
++	n, err := r.ReadCloser.Read(p)
++	if n > 0 {
++		r.tp.add(p[:n])
++		if r.hello {
++			r.buf.Write(p[:n])
++		}
++	}
++	if err == io.EOF && r.hello {
++		r.tp.mu.Lock()
++		r.tp.hello = append(r.tp.hello, append([]byte(nil), r.buf.Bytes()...))
++		r.tp.mu.Unlock()
++	}
++	return n, err
++}
++
++// e2eEnv — сервер с реестром, сессиями и «подслушивающим CDN» перед ним.
++type e2eEnv struct {
++	srv  *httptest.Server
++	gate *linkGate
++	ts   *tunnelServer
++	tap  *tap
++}
++
++func resetE2EGlobals() {
++	authToken, linkCred, deviceID = "", "", ""
++	clientSess.Store(nil)
++	requireE2E, clientLegacy = false, false
++	clientNow = time.Now
++	clientTransport, clientMethod, fastOpen = "chunked", "post", true
++}
++
++func newE2EEnv(t *testing.T, master string) *e2eEnv {
++	t.Helper()
++	resetE2EGlobals()
++	t.Cleanup(resetE2EGlobals)
++	authToken = master
++	st = &stats{}
++	serverMethod = "both"
++	gate := newLinkGate()
++	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}, gate: gate}
++	mux := http.NewServeMux()
++	mux.HandleFunc("/hello", handleHello)
++	mux.HandleFunc("/t/connect", ts.handleConnect)
++	mux.HandleFunc("/t/down", ts.handleDown)
++	mux.HandleFunc("/t/up", ts.handleUp)
++	mux.HandleFunc("/t/ups", ts.handleUpStream)
++	mux.HandleFunc("/t/close", ts.handleClose)
++	mux.HandleFunc("/u/open", ts.handleUDPOpen)
++	mux.HandleFunc("/u/down", ts.handleUDPDown)
++	mux.HandleFunc("/u/send", ts.handleUDPSend)
++	mux.HandleFunc("/u/close", ts.handleUDPClose)
++	mux.HandleFunc("/bye", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
++	inner := gate.middleware(mux)
++
++	tp := &tap{}
++	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var hdr bytes.Buffer
++		hdr.WriteString(r.Method + " " + r.URL.String() + "\n")
++		r.Header.Write(&hdr)
++		tp.add(hdr.Bytes())
++		r.Body = &tapReader{ReadCloser: r.Body, tp: tp, hello: r.URL.Path == "/hello" && r.Header.Get(kxHeader) != ""}
++		inner.ServeHTTP(tapWriter{w, tp}, r)
++	}))
++	srv.EnableHTTP2 = true
++	srv.StartTLS()
++	t.Cleanup(srv.Close)
++	return &e2eEnv{srv: srv, gate: gate, ts: ts, tap: tp}
++}
++
++func (e *e2eEnv) client() *tunnelClient {
++	hc := &http.Client{Transport: authRoundTripper{base: e.srv.Client().Transport, id: "test"}}
++	return &tunnelClient{base: e.srv.URL, pool: []*http.Client{hc}, udp: true}
++}
++
++func TestHKDFAndPBKDF2KnownAnswers(t *testing.T) {
++	// RFC 5869, test case 1.
++	ikm, _ := hex.DecodeString("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
++	salt, _ := hex.DecodeString("000102030405060708090a0b0c")
++	info, _ := hex.DecodeString("f0f1f2f3f4f5f6f7f8f9")
++	okm := hkdfExpand(hkdfExtract(salt, ikm), string(info), 42)
++	if got := hex.EncodeToString(okm); got != "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865" {
++		t.Fatalf("HKDF: %s", got)
++	}
++	// RFC 7914 / общеизвестные векторы PBKDF2-HMAC-SHA256.
++	if got := hex.EncodeToString(pbkdf2([]byte("password"), []byte("salt"), 1, 32)); got != "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b" {
++		t.Fatalf("PBKDF2 c=1: %s", got)
++	}
++	if got := hex.EncodeToString(pbkdf2([]byte("password"), []byte("salt"), 2, 32)); got != "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43" {
++		t.Fatalf("PBKDF2 c=2: %s", got)
++	}
++}
++
++func TestRecordsRoundTripAndTamper(t *testing.T) {
++	key := hkdfExpand([]byte("k"), "t", 32)
++	a := newGCM(key)
++	src := bytes.Repeat([]byte("привет-"), 10000)
++	sr := newSealReader(bytes.NewReader(src), a, "aad")
++	wire, _ := io.ReadAll(sr)
++	got, err := io.ReadAll(newOpenReader(bytes.NewReader(wire), a, "aad"))
++	if err != nil || !bytes.Equal(got, src) {
++		t.Fatalf("round trip: err=%v, равны=%v", err, bytes.Equal(got, src))
++	}
++	bad := append([]byte(nil), wire...)
++	bad[len(bad)/2] ^= 1
++	if _, err := io.ReadAll(newOpenReader(bytes.NewReader(bad), a, "aad")); err == nil {
++		t.Fatal("подмена записи не обнаружена")
++	}
++	if _, err := io.ReadAll(newOpenReader(bytes.NewReader(wire), a, "другой-aad")); err == nil {
++		t.Fatal("чужой AAD принят")
++	}
++	// Перестановка записей местами (счётчик в nonce) тоже должна ломаться.
++	r1 := sealRecord(a, 0, []byte("x"), []byte("one"))
++	r2 := sealRecord(a, 1, []byte("x"), []byte("two"))
++	if _, err := io.ReadAll(newOpenReader(bytes.NewReader(append(r2, r1...)), a, "x")); err == nil {
++		t.Fatal("перестановка записей не обнаружена")
++	}
++}
++
++func TestReplayWindow(t *testing.T) {
++	var w replayWindow
++	for _, c := range []uint64{5, 3, 7, 6} {
++		if !w.accept(c) {
++			t.Fatalf("%d должен приниматься", c)
++		}
++	}
++	for _, c := range []uint64{5, 3, 7} {
++		if w.accept(c) {
++			t.Fatalf("повтор %d принят", c)
++		}
++	}
++	w.accept(1000)
++	if w.accept(900) {
++		t.Fatal("счётчик за окном принят")
++	}
++	if !w.accept(999) {
++		t.Fatal("счётчик внутри окна отклонён")
++	}
++}
++
++func TestE2EHandshakeOwner(t *testing.T) {
++	e := newE2EEnv(t, "длинный-мастер-ключ")
++	tc := e.client()
++	if err := tc.helloE2E(); err != nil {
++		t.Fatal(err)
++	}
++	if clientSess.Load() == nil {
++		t.Fatal("сессия не создана")
++	}
++	// Сессионный запрос без секретов проходит.
++	req, _ := http.NewRequest(http.MethodPost, e.srv.URL+"/hello", strings.NewReader("tok"))
++	resp, err := tc.pool[0].Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	b, _ := io.ReadAll(resp.Body)
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusOK || string(b) != helloPrefix+"tok" {
++		t.Fatalf("ping в сессии: %d %q", resp.StatusCode, b)
++	}
++	if e.tap.seen([]byte("длинный-мастер-ключ")) || e.tap.seen([]byte(authHeader)) {
++		t.Fatal("мастер-ключ или его заголовок виден на проводе")
++	}
++}
++
++func TestE2EWrongKeyLooksLikeForeignSite(t *testing.T) {
++	e := newE2EEnv(t, "правильный")
++	tc := e.client()
++	_, err := tc.clientKxWith(context.Background(), kxKindOwner, "", ownerPSK("неправильный"))
++	if err == nil {
++		t.Fatal("рукопожатие с чужим ключом прошло")
++	}
++	if errors.As(err, new(kxDeny)) {
++		t.Fatalf("сервер выдал причину отказа тому, кто не знает ключ: %v", err)
++	}
++	// Ссылка, подписанная чужим мастер-ключом, тоже неотличима от «чужого сайта».
++	fake := credMAC("другой-мастер", "deadbeefdeadbeef")
++	_, err = tc.clientKxWith(context.Background(), kxKindLink, "deadbeefdeadbeef", linkPSK(fake))
++	if err == nil || errors.As(err, new(kxDeny)) {
++		t.Fatalf("поддельная ссылка: %v", err)
++	}
++}
++
++func TestE2ELinkLifecycle(t *testing.T) {
++	e := newE2EEnv(t, "мастер")
++	rec := e.gate.issueLink("Андрею")
++	cred := rec.ID + "." + credMAC("мастер", rec.ID)
++	linkCred, deviceID = cred, "телефон-1"
++	tc := e.client()
++	if err := tc.helloE2E(); err != nil {
++		t.Fatalf("ссылка не подключилась: %v", err)
++	}
++	if e.tap.seen([]byte(cred)) || e.tap.seen([]byte(credMAC("мастер", rec.ID))) {
++		t.Fatal("удостоверение ссылки видно на проводе")
++	}
++	if e.tap.seen([]byte("телефон-1")) {
++		t.Fatal("отпечаток устройства виден на проводе")
++	}
++	// Отзыв: уже открытая сессия получает отказ, новое рукопожатие — причину.
++	e.gate.setRevoked(rec.ID, true)
++	req, _ := http.NewRequest(http.MethodPost, e.srv.URL+"/hello", strings.NewReader("x"))
++	resp, err := tc.pool[0].Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	body, _ := io.ReadAll(resp.Body)
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), denyRevoked) {
++		t.Fatalf("сессия отозванной ссылки: %d %q", resp.StatusCode, body)
++	}
++	clientSess.Store(nil)
++	var d kxDeny
++	if _, err := tc.clientKx(context.Background()); !errors.As(err, &d) || d.reason != denyRevoked {
++		t.Fatalf("рукопожатие по отозванной ссылке: %v", err)
++	}
++	// Другое устройство на занятой ссылке.
++	e.gate.setRevoked(rec.ID, false)
++	deviceID = "чужой-телефон"
++	if _, err := tc.clientKx(context.Background()); !errors.As(err, &d) || d.reason != denyUsed {
++		t.Fatalf("занятая ссылка: %v", err)
++	}
++}
++
++func TestE2EClockSkewIsReported(t *testing.T) {
++	e := newE2EEnv(t, "мастер")
++	clientNow = func() time.Time { return time.Now().Add(10 * time.Minute) }
++	var d kxDeny
++	if _, err := e.client().clientKx(context.Background()); !errors.As(err, &d) || d.reason != denyClock {
++		t.Fatalf("ожидалась причина %q, получено: %v", denyClock, err)
++	}
++}
++
++func TestE2EReplayedHandshakeRejected(t *testing.T) {
++	e := newE2EEnv(t, "мастер")
++	tc := e.client()
++	if err := tc.helloE2E(); err != nil {
++		t.Fatal(err)
++	}
++	e.tap.mu.Lock()
++	if len(e.tap.hello) == 0 {
++		e.tap.mu.Unlock()
++		t.Fatal("рукопожатие не перехвачено")
++	}
++	raw := e.tap.hello[0]
++	e.tap.mu.Unlock()
++	req, _ := http.NewRequest(http.MethodPost, e.srv.URL+"/hello", bytes.NewReader(raw))
++	req.Header.Set(kxHeader, "1")
++	resp, err := e.srv.Client().Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusNotFound {
++		t.Fatalf("повтор рукопожатия принят: %d", resp.StatusCode)
++	}
++}
++
++func TestE2ESocksThroughEncryption(t *testing.T) {
++	marker := "СЕКРЕТНЫЙ-ТРАФИК-1234567890"
++	cases := []struct {
++		name, transport, method string
++		fast                    bool
++	}{
++		{"chunked-post", "chunked", "post", true},
++		{"chunked-get", "chunked", "get", false},
++		{"stream", "stream", "post", true},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			e := newE2EEnv(t, "мастер-ключ-для-e2e")
++			echoHost, echoPort := splitAddr(t, startEcho(t))
++			clientTransport, clientMethod, fastOpen = c.transport, c.method, c.fast
++			tc := e.client()
++			if err := tc.helloE2E(); err != nil {
++				t.Fatal(err)
++			}
++			proxy, drain := socksProxy(t, tc)
++			app := socksConnect(t, proxy, echoHost, echoPort)
++			app.Write([]byte(marker))
++			got := make([]byte, len(marker))
++			if _, err := io.ReadFull(bufio.NewReader(app), got); err != nil {
++				t.Fatalf("read: %v", err)
++			}
++			if string(got) != marker {
++				t.Fatalf("эхо: %q", got)
++			}
++			app.Close()
++			drain()
++			for _, secret := range []string{marker, echoHost + ":", "мастер-ключ-для-e2e"} {
++				if e.tap.seen([]byte(secret)) {
++					t.Fatalf("на проводе виден открытый текст: %q", secret)
++				}
++			}
++			// Адрес назначения тоже не должен читаться (в base64-виде для GET).
++			if e.tap.seen([]byte(net.JoinHostPort(echoHost, itoa(echoPort)))) {
++				t.Fatal("адрес назначения виден на проводе")
++			}
++		})
++	}
++}
++
++func itoa(n int) string { return strconv.Itoa(n) }
++
++func TestE2EBulkTransfer(t *testing.T) {
++	for _, tr := range []string{"chunked", "stream"} {
++		t.Run(tr, func(t *testing.T) {
++			e := newE2EEnv(t, "мастер")
++			echoHost, echoPort := splitAddr(t, startEcho(t))
++			clientTransport, clientMethod, fastOpen = tr, "post", true
++			tc := e.client()
++			if err := tc.helloE2E(); err != nil {
++				t.Fatal(err)
++			}
++			proxy, drain := socksProxy(t, tc)
++			app := socksConnect(t, proxy, echoHost, echoPort)
++			const n = 4 << 20
++			src := make([]byte, n)
++			for i := range src {
++				src[i] = byte(i*31 + 7)
++			}
++			go func() { app.Write(src) }()
++			got := make([]byte, n)
++			if _, err := io.ReadFull(app, got); err != nil {
++				t.Fatalf("read: %v", err)
++			}
++			if !bytes.Equal(got, src) {
++				t.Fatal("данные исказились")
++			}
++			app.Close()
++			drain()
++		})
++	}
++}
++
++func TestE2ETamperedChunkRejected(t *testing.T) {
++	e := newE2EEnv(t, "мастер")
++	echo := startEcho(t)
++	tc := e.client()
++	if err := tc.helloE2E(); err != nil {
++		t.Fatal(err)
++	}
++	hc := tc.pool[0]
++	if err := tc.connect(hc, "tamper1", echo); err != nil {
++		t.Fatal(err)
++	}
++	// Мусор вместо шифртекста и «чужой» seq — оба отклоняются.
++	for _, seq := range []string{"0", "7"} {
++		req, _ := http.NewRequest(http.MethodPost, e.srv.URL+"/t/up?id=tamper1&seq="+seq, strings.NewReader("не-шифртекст-совсем-не-шифртекст"))
++		resp, err := hc.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		resp.Body.Close()
++		if resp.StatusCode != http.StatusBadRequest {
++			t.Fatalf("seq=%s: %d, ожидался 400", seq, resp.StatusCode)
++		}
++	}
++	// Настоящий чанк с подменённым seq в URL не проходит (nonce и AAD привязаны к seq).
++	k := tc.streamKeysFor("tamper1")
++	ct := k.up.Seal(nil, nonceFor(0), []byte("данные"), upAAD("tamper1", 0, false))
++	req, _ := http.NewRequest(http.MethodPost, e.srv.URL+"/t/up?id=tamper1&seq=1", bytes.NewReader(ct))
++	resp, err := hc.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusBadRequest {
++		t.Fatalf("переставленный seq принят: %d", resp.StatusCode)
++	}
++	// Повтор connect с тем же id не подменяет стрим.
++	if err := tc.connect(hc, "tamper1", echo); err == nil {
++		t.Fatal("повторный connect с тем же id принят")
++	}
++}
++
++func TestRequireE2ERejectsLegacy(t *testing.T) {
++	e := newE2EEnv(t, "мастер")
++	requireE2E = true
++	for _, path := range []string{"/hello", "/t/connect?id=x"} {
++		req, _ := http.NewRequest(http.MethodPost, e.srv.URL+path, strings.NewReader("127.0.0.1:1"))
++		req.Header.Set(authHeader, "мастер")
++		resp, err := e.srv.Client().Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		resp.Body.Close()
++		if resp.StatusCode != http.StatusNotFound {
++			t.Fatalf("%s без E2E: %d, ожидался 404", path, resp.StatusCode)
++		}
++	}
++	// А E2E-клиент работает.
++	if err := e.client().helloE2E(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestE2EUDP(t *testing.T) {
++	e := newE2EEnv(t, "мастер")
++	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer pc.Close()
++	go func() {
++		buf := make([]byte, 2048)
++		for {
++			n, a, err := pc.ReadFrom(buf)
++			if err != nil {
++				return
++			}
++			pc.WriteTo(append([]byte("echo:"), buf[:n]...), a)
++		}
++	}()
++	tc := e.client()
++	if err := tc.helloE2E(); err != nil {
++		t.Fatal(err)
++	}
++	hc := tc.pool[0]
++	if err := tc.udpOpen(hc, "u1"); err != nil {
++		t.Fatal(err)
++	}
++	defer tc.udpClose(hc, "u1")
++
++	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+"/u/down?id=u1", nil)
++	resp, err := hc.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	uk, _ := tc.ukeys.Load("u1")
++	body := newOpenReader(resp.Body, uk.(*udpClientKeys).keys.down, "ud|u1")
++
++	tc.udpSend(hc, "u1", encodeFrame(pc.LocalAddr().String(), []byte("UDP-СЕКРЕТ")))
++	h := make([]byte, 2)
++	if _, err := io.ReadFull(body, h); err != nil {
++		t.Fatalf("down: %v", err)
++	}
++	addr := make([]byte, int(h[0])<<8|int(h[1]))
++	io.ReadFull(body, addr)
++	io.ReadFull(body, h)
++	data := make([]byte, int(h[0])<<8|int(h[1]))
++	io.ReadFull(body, data)
++	if string(data) != "echo:UDP-СЕКРЕТ" {
++		t.Fatalf("UDP эхо: %q", data)
++	}
++	if e.tap.seen([]byte("UDP-СЕКРЕТ")) {
++		t.Fatal("UDP-данные видны на проводе")
++	}
++}
+diff --git a/fingerprint.go b/fingerprint.go
+new file mode 100644
+index 0000000..bfc39fe
+--- /dev/null
++++ b/fingerprint.go
+@@ -0,0 +1,182 @@
++package main
++
++// Маскировка TLS-отпечатка клиента под настоящий браузер (uTLS).
++//
++// Зачем: стандартный crypto/tls Go-клиента даёт легко узнаваемый JA3/JA4 —
++// порядок расширений, наборов шифров и кривых у Go отличается от Chrome,
++// Firefox и т.п. WAF/DPI перед CDN может фильтровать именно по этому
++// отпечатку, независимо от того, что происходит внутри TLS-туннеля.
++//
++// Подход: один раз согласовываем ALPN настоящим отпечатком браузера (uTLS),
++// затем в зависимости от результата ("h2" или "http/1.1") строим обычный
++// http.Transport или golang.org/x/net/http2.Transport, но с DialTLSContext,
++// который на каждое новое соединение делает TLS-рукопожатие через uTLS с тем
++// же отпечатком. Сквозное шифрование (e2e.go) и это никак не пересекаются —
++// оба слоя работают независимо и решают разные задачи: uTLS прячет форму
++// TLS-рукопожатия, e2e.go прячет содержимое HTTP-тела от CDN.
++
++import (
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"fmt"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++
++	utls "github.com/refraction-networking/utls"
++	"golang.org/x/net/http2"
++)
++
++// Настройка (флаг -tls-fingerprint).
++var tlsFingerprint = "chrome"
++
++// tlsRootCAsOverride позволяет тестам подсунуть пул доверенных сертификатов
++// тестового TLS-сервера. В проде всегда nil — используются системные корни,
++// как у обычного TLS-клиента.
++var tlsRootCAsOverride *x509.CertPool
++
++// cdnAddr — адрес CDN на порту 443 для боевого пути (тесты дают свой ip:port
++// напрямую в dialFingerprinted/negotiateALPN, минуя эту обёртку).
++func cdnAddr(ip string) string { return net.JoinHostPort(ip, "443") }
++
++// helloByName сопоставляет имя флага с отпечатком uTLS. "go" отключает uTLS
++// целиком — используется штатный crypto/tls, как раньше (на случай, если
++// перед CDN стоит что-то, что ломается именно на нестандартном ClientHello).
++func helloByName(name string) (utls.ClientHelloID, bool) {
++	switch strings.ToLower(name) {
++	case "chrome":
++		return utls.HelloChrome_Auto, true
++	case "firefox":
++		return utls.HelloFirefox_Auto, true
++	case "safari":
++		return utls.HelloSafari_Auto, true
++	case "ios":
++		return utls.HelloIOS_Auto, true
++	case "edge":
++		return utls.HelloEdge_Auto, true
++	case "android":
++		return utls.HelloAndroid_11_OkHttp, true
++	case "random":
++		return utls.HelloRandomized, true
++	case "go", "off", "":
++		return utls.ClientHelloID{}, false
++	default:
++		return utls.ClientHelloID{}, false
++	}
++}
++
++// dialFingerprinted устанавливает TCP-соединение и делает TLS-рукопожатие
++// через uTLS выбранным отпечатком. Возвращает уже готовое TLS-соединение —
++// вызывающий сам решает, что с ним делать (обычный http.Transport или h2).
++func dialFingerprinted(ctx context.Context, addr, host string, hello utls.ClientHelloID) (net.Conn, error) {
++	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
++	raw, err := d.DialContext(ctx, "tcp", addr)
++	if err != nil {
++		return nil, err
++	}
++	tuneConn(raw) // без Nagle + большие буферы, как и на обычном пути
++	uc := utls.UClient(raw, &utls.Config{ServerName: host, RootCAs: tlsRootCAsOverride}, hello)
++	if err := uc.HandshakeContext(ctx); err != nil {
++		raw.Close()
++		return nil, fmt.Errorf("uTLS handshake: %w", err)
++	}
++	return uc, nil
++}
++
++// negotiateALPN делает разовое пробное рукопожатие, чтобы узнать, что выберет
++// CDN — h2 или http/1.1 — с данным отпечатком. Дальше все реальные соединения
++// пула строятся сразу под этот протокол, без пробы на каждое из них.
++func negotiateALPN(ctx context.Context, addr, host string, hello utls.ClientHelloID) (string, error) {
++	conn, err := dialFingerprinted(ctx, addr, host, hello)
++	if err != nil {
++		return "", err
++	}
++	defer conn.Close()
++	proto := conn.(*utls.UConn).ConnectionState().NegotiatedProtocol
++	if proto == "" {
++		proto = "http/1.1" // CDN не согласовал ALPN — обычный TLS без h2
++	}
++	return proto, nil
++}
++
++// buildCDNClient выбирает транспорт для одного соединения пула: с TLS-
++// отпечатком браузера (uTLS) или обычный crypto/tls, если отпечаток выключен
++// флагом -tls-fingerprint или проба не удалась (тогда — не молча: печатаем
++// причину один раз на весь процесс и работаем как раньше).
++func buildCDNClient(ip, host string) *http.Client {
++	hello, ok := helloByName(tlsFingerprint)
++	if !ok {
++		if s := strings.ToLower(tlsFingerprint); s != "go" && s != "off" && s != "" {
++			warnUnknownFingerprintOnce(tlsFingerprint)
++		}
++		return cdnClient(ip, host)
++	}
++	addr := cdnAddr(ip)
++	alpn, err := fingerprintALPNOnce(addr, host, hello)
++	if err != nil {
++		warnFingerprintFailedOnce(err)
++		return cdnClient(ip, host)
++	}
++	return fingerprintedClient(addr, host, alpn, hello)
++}
++
++var (
++	fpOnce   sync.Once
++	fpALPN   string
++	fpErr    error
++	warnOnce sync.Once
++)
++
++// fingerprintALPNOnce гоняет negotiateALPN один раз на процесс: ip/host у
++// всего пула клиента одни и те же, а лишние TLS-рукопожатия только заметнее.
++func fingerprintALPNOnce(addr, host string, hello utls.ClientHelloID) (string, error) {
++	fpOnce.Do(func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		fpALPN, fpErr = negotiateALPN(ctx, addr, host, hello)
++	})
++	return fpALPN, fpErr
++}
++
++func warnFingerprintFailedOnce(err error) {
++	warnOnce.Do(func() {
++		fmt.Printf("⚠ TLS-отпечаток (%s) не удался (%v) — использую обычный TLS Go для всех соединений\n", tlsFingerprint, err)
++	})
++}
++
++func warnUnknownFingerprintOnce(name string) {
++	warnOnce.Do(func() {
++		fmt.Printf("⚠ неизвестный -tls-fingerprint=%q (варианты: chrome, firefox, safari, ios, edge, android, random, go) — использую обычный TLS Go\n", name)
++	})
++}
++
++// alpn — результат negotiateALPN: определяет, какой транспорт (h2 или h1)
++// строить; каждое новое соединение внутри него всё равно делает своё uTLS
++// рукопожатие — согласованный на пробе ALPN лишь выбирает КАКОЙ транспорт
++// использовать, а не переиспользует сам пробный конн.
++func fingerprintedClient(addr, host, alpn string, hello utls.ClientHelloID) *http.Client {
++	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
++		return dialFingerprinted(ctx, addr, host, hello)
++	}
++	if alpn == "h2" {
++		tr := &http2.Transport{
++			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
++				return dial(ctx, network, addr)
++			},
++			ReadIdleTimeout: 30 * time.Second,
++		}
++		return &http.Client{Transport: authRoundTripper{base: tr, id: clientID}}
++	}
++	tr := &http.Transport{
++		DialTLSContext:      dial,
++		DisableCompression:  true,
++		IdleConnTimeout:     5 * time.Minute,
++		WriteBufferSize:     64 * 1024,
++		ReadBufferSize:      64 * 1024,
++		MaxIdleConnsPerHost: 4,
++	}
++	return &http.Client{Transport: authRoundTripper{base: tr, id: clientID}}
++}
+diff --git a/fingerprint_test.go b/fingerprint_test.go
+new file mode 100644
+index 0000000..cb642a8
+--- /dev/null
++++ b/fingerprint_test.go
+@@ -0,0 +1,189 @@
++package main
++
++import (
++	"context"
++	"crypto/x509"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"testing"
++	"time"
++
++	utls "github.com/refraction-networking/utls"
++)
++
++func resetFingerprintOnces() {
++	fpOnce, warnOnce = sync.Once{}, sync.Once{}
++	fpALPN, fpErr = "", nil
++	tlsRootCAsOverride = nil
++	tlsFingerprint = "chrome"
++}
++
++// tlsTestServer поднимает httptest-сервер и настраивает tlsRootCAsOverride,
++// чтобы uTLS-клиент в тестах реально проверял сертификат, а не отключал
++// проверку — это ближе к тому, что происходит с настоящим CDN.
++func tlsTestServer(t *testing.T, h2 bool, handler http.HandlerFunc) *httptest.Server {
++	t.Helper()
++	srv := httptest.NewUnstartedServer(handler)
++	srv.EnableHTTP2 = h2
++	srv.StartTLS()
++	t.Cleanup(srv.Close)
++	pool := x509.NewCertPool()
++	pool.AddCert(srv.Certificate())
++	t.Cleanup(func() { tlsRootCAsOverride = nil })
++	tlsRootCAsOverride = pool
++	return srv
++}
++
++func TestHelloByName(t *testing.T) {
++	for _, name := range []string{"chrome", "Chrome", "firefox", "safari", "ios", "edge", "android", "random"} {
++		if _, ok := helloByName(name); !ok {
++			t.Errorf("%q должен резолвиться в отпечаток", name)
++		}
++	}
++	for _, name := range []string{"go", "off", "", "netscape", "GO"} {
++		if hello, ok := helloByName(name); ok {
++			t.Errorf("%q не должен давать отпечаток, получено %+v", name, hello)
++		}
++	}
++}
++
++func TestNegotiateALPNHTTP2AndHTTP1(t *testing.T) {
++	t.Cleanup(resetFingerprintOnces)
++	for _, tc := range []struct {
++		name string
++		h2   bool
++		want string
++	}{
++		{"h2", true, "h2"},
++		{"h1", false, "http/1.1"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			resetFingerprintOnces()
++			srv := tlsTestServer(t, tc.h2, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
++			addr := srv.Listener.Addr().String()
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++			proto, err := negotiateALPN(ctx, addr, "example.com", utls.HelloChrome_Auto)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if proto != tc.want {
++				t.Fatalf("ALPN=%q, ожидался %q", proto, tc.want)
++			}
++		})
++	}
++}
++
++func TestFingerprintedClientRoundTrip(t *testing.T) {
++	t.Cleanup(resetFingerprintOnces)
++	for _, tc := range []struct {
++		name string
++		h2   bool
++	}{{"h2", true}, {"h1", false}} {
++		t.Run(tc.name, func(t *testing.T) {
++			resetFingerprintOnces()
++			const body = "секретный-ответ-сервера"
++			var gotProto string
++			srv := tlsTestServer(t, tc.h2, func(w http.ResponseWriter, r *http.Request) {
++				gotProto = r.Proto
++				w.Write([]byte(body))
++			})
++			addr := srv.Listener.Addr().String()
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++			alpn, err := negotiateALPN(ctx, addr, "example.com", utls.HelloChrome_Auto)
++			if err != nil {
++				t.Fatal(err)
++			}
++			hc := fingerprintedClient(addr, "example.com", alpn, utls.HelloChrome_Auto)
++			resp, err := hc.Get("https://example.com/")
++			if err != nil {
++				t.Fatal(err)
++			}
++			got, _ := io.ReadAll(resp.Body)
++			resp.Body.Close()
++			if string(got) != body {
++				t.Fatalf("тело: %q", got)
++			}
++			wantProto := "HTTP/1.1"
++			if tc.h2 {
++				wantProto = "HTTP/2.0"
++			}
++			if gotProto != wantProto {
++				t.Fatalf("сервер увидел протокол %q, ожидался %q", gotProto, wantProto)
++			}
++		})
++	}
++}
++
++func TestFingerprintRejectsWrongHostname(t *testing.T) {
++	t.Cleanup(resetFingerprintOnces)
++	srv := tlsTestServer(t, false, func(w http.ResponseWriter, r *http.Request) {})
++	addr := srv.Listener.Addr().String()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	// Сертификат httptest выписан на 127.0.0.1/example.com, а не на этот хост:
++	// проверка имени должна отработать, а не быть тихо отключена.
++	if _, err := negotiateALPN(ctx, addr, "не-тот-хост.invalid", utls.HelloChrome_Auto); err == nil {
++		t.Fatal("рукопожатие с неверным SNI/CN прошло — проверка сертификата отключена?")
++	}
++}
++
++func TestBuildCDNClientFallsBackOnBadFingerprintName(t *testing.T) {
++	t.Cleanup(resetFingerprintOnces)
++	resetFingerprintOnces()
++	tlsFingerprint = "netscape-navigator"
++	hc := buildCDNClient("127.0.0.1", "example.com")
++	if hc == nil {
++		t.Fatal("nil client")
++	}
++	// Обычный cdnClient использует стандартный http.Transport с TLSClientConfig.
++	tr, ok := hc.Transport.(authRoundTripper).base.(*http.Transport)
++	if !ok || tr.TLSClientConfig == nil {
++		t.Fatal("неизвестное имя отпечатка должно откатываться на обычный http.Transport")
++	}
++}
++
++func TestBuildCDNClientFallsBackWhenHandshakeFails(t *testing.T) {
++	t.Cleanup(resetFingerprintOnces)
++	resetFingerprintOnces()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	go func() { // принимаем TCP и сразу рвём — TLS-рукопожатие не состоится
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			c.Close()
++		}
++	}()
++	if _, err := fingerprintALPNOnce(ln.Addr().String(), "example.com", utls.HelloChrome_Auto); err == nil {
++		t.Fatal("рукопожатие с обрывающим соединение сервером неожиданно удалось")
++	}
++}
++
++func TestFingerprintUsesBrowserClientHello(t *testing.T) {
++	t.Cleanup(resetFingerprintOnces)
++	// Реальный uTLS-отпечаток Chrome отличается от stdlib crypto/tls в первую
++	// очередь порядком/составом расширений ClientHello. Полноценный разбор
++	// ClientHello избыточен для целей маскировки; здесь смок-тест: с разными
++	// ID согласование всё ещё проходит (регрессия — если у обоих перестанет
++	// работать, значит сломан сам вызов uTLS, а не что-то по теме отпечатка).
++	srv := tlsTestServer(t, true, func(w http.ResponseWriter, r *http.Request) {})
++	addr := srv.Listener.Addr().String()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	if _, err := negotiateALPN(ctx, addr, "example.com", utls.HelloChrome_Auto); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := negotiateALPN(ctx, addr, "example.com", utls.HelloGolang); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/go.mod b/go.mod
+index 09dc8dc..ec0e590 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,29 @@
+ module cdntunnel
+ 
+-go 1.27.1
++go 1.22
++
++// Локальная сборка в этом окружении не достаёт до proxy.golang.org/golang.org —
++// эти replace смотрят на официальные read-only зеркала Go-команды на GitHub.
++// На обычной машине с доступом в интернет их можно убрать: `go mod tidy` сам
++// подтянет канонические golang.org/x/* с proxy.golang.org.
++replace golang.org/x/crypto => github.com/golang/crypto v0.21.0
++
++replace golang.org/x/net => github.com/golang/net v0.23.0
++
++replace golang.org/x/sys => github.com/golang/sys v0.18.0
++
++replace golang.org/x/text => github.com/golang/text v0.14.0
++
++require (
++	github.com/refraction-networking/utls v1.6.7
++	golang.org/x/net v0.23.0
++)
++
++require (
++	github.com/andybalholm/brotli v1.0.6 // indirect
++	github.com/cloudflare/circl v1.3.7 // indirect
++	github.com/klauspost/compress v1.17.4 // indirect
++	golang.org/x/crypto v0.21.0 // indirect
++	golang.org/x/sys v0.18.0 // indirect
++	golang.org/x/text v0.14.0 // indirect
++)
+diff --git a/go.sum b/go.sum
+new file mode 100644
+index 0000000..b78215d
+--- /dev/null
++++ b/go.sum
+@@ -0,0 +1,16 @@
++github.com/andybalholm/brotli v1.0.6 h1:Yf9fFpf49Zrxb9NlQaluyE92/+X7UVHlhMNJN2sxfOI=
++github.com/andybalholm/brotli v1.0.6/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
++github.com/cloudflare/circl v1.3.7 h1:qlCDlTPz2n9fu58M0Nh1J/JzcFpfgkFHHX3O35r5vcU=
++github.com/cloudflare/circl v1.3.7/go.mod h1:sRTcRWXGLrKw6yIGJ+l7amYJFfAXbZG0kBSc8r4zxgA=
++github.com/golang/crypto v0.21.0 h1:49mVf0FYAXWS396CMOMsKqJ44xXFskRGWQOASDLOCmk=
++github.com/golang/crypto v0.21.0/go.mod h1:0BP7YvVV9gBbVKyeTG0Gyn+gZm94bibOW5BjDEYAOMs=
++github.com/golang/net v0.23.0 h1:Mc1BIzYmQ9y1pc72S4v5h1bBe5mttZryg+H6y0hEG14=
++github.com/golang/net v0.23.0/go.mod h1:JKghWKKOSdJwpW2GEx0Ja7fmaKnMsbu+MWVZTokSYmg=
++github.com/golang/sys v0.18.0 h1:kuM3dZyaFSTjh5R08OjBMMX1KXS8P+O5q5xqWuR0USg=
++github.com/golang/sys v0.18.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
++github.com/golang/text v0.14.0 h1:GF4MlwaDCyaJpbmRJTlN4gjsuesoOWAdHLtN3I63Fd8=
++github.com/golang/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
++github.com/klauspost/compress v1.17.4 h1:Ej5ixsIri7BrIjBkRZLTo6ghwrEtHFk7ijlczPW4fZ4=
++github.com/klauspost/compress v1.17.4/go.mod h1:/dCuZOvVtNoHsyb+cuJD3itjs3NbnF6KH9zAO4BDxPM=
++github.com/refraction-networking/utls v1.6.7 h1:zVJ7sP1dJx/WtVuITug3qYUq034cDq9B2MR1K67ULZM=
++github.com/refraction-networking/utls v1.6.7/go.mod h1:BC3O4vQzye5hqpmDTWUqi4P5DDhzJfkV1tdqtawQIH0=
+diff --git a/hardening.go b/hardening.go
+new file mode 100644
+index 0000000..3fab011
+--- /dev/null
++++ b/hardening.go
+@@ -0,0 +1,183 @@
++package main
++
++// Защитные помощники сервера: фильтр целей (SSRF), лимит перебора ключа,
++// доступ к /admin только с самой машины.
++
++import (
++	"errors"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++)
++
++// Лимиты на входящие данные.
++const (
++	maxPayload     = 4 << 20  // тело одного запроса (chunk/connect/udp), байт
++	maxUpAhead     = 1024     // насколько seq может опережать уже записанный (chunked up)
++	maxUpBufBytes  = 32 << 20 // сколько байт ждёт в реассемблере одного стрима
++	maxAuthFails   = 10       // неудачных попыток ключа с одного адреса...
++	authFailWindow = 5 * time.Minute
++	authBanTime    = 15 * time.Minute
++	maxGuardKeys   = 20000
++)
++
++// Флаги (заполняются в main).
++var (
++	allowPrivate bool // -allow-private: разрешить всем ходить во внутренние сети
++	adminRemote  bool // -admin-remote: пускать /admin не только с localhost
++)
++
++var errBlockedTarget = errors.New("target not allowed")
++var errPayloadTooLarge = errors.New("payload too large")
++
++var blockedNets = mustCIDRs(
++	"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24",
++	"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
++)
++
++func mustCIDRs(list ...string) []*net.IPNet {
++	out := make([]*net.IPNet, 0, len(list))
++	for _, c := range list {
++		_, n, err := net.ParseCIDR(c)
++		if err != nil {
++			panic(err)
++		}
++		out = append(out, n)
++	}
++	return out
++}
++
++// blockedIP — адреса, куда обычному пользователю ссылки ходить нельзя:
++// loopback, частные и link-local сети (в т.ч. метаданные облака 169.254.169.254).
++func blockedIP(ip net.IP) bool {
++	if ip == nil {
++		return true
++	}
++	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
++		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
++		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
++		return true
++	}
++	if v4 := ip.To4(); v4 != nil {
++		for _, n := range blockedNets {
++			if n.Contains(v4) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// targetDialer — Dialer, который проверяет уже РАЗРЕШЁННЫЙ адрес прямо перед
++// connect (защита от DNS rebinding). Владелец сервера ограничений не имеет.
++func targetDialer(owner bool) *net.Dialer {
++	d := &net.Dialer{Timeout: 10 * time.Second}
++	if owner || allowPrivate {
++		return d
++	}
++	d.Control = func(network, address string, _ syscall.RawConn) error {
++		host, _, err := net.SplitHostPort(address)
++		if err != nil || blockedIP(net.ParseIP(host)) {
++			return errBlockedTarget
++		}
++		return nil
++	}
++	return d
++}
++
++// udpTargetAllowed проверяет адрес назначения UDP-датаграммы.
++func udpTargetAllowed(ua *net.UDPAddr, owner bool) bool {
++	return owner || allowPrivate || !blockedIP(ua.IP)
++}
++
++// adminAllowed: панель открыта только запросам с самой машины (SSH → curl
++// на localhost, как делает приложение) и без следов прокси/CDN в заголовках.
++func adminAllowed(r *http.Request) bool {
++	if adminRemote {
++		return true
++	}
++	h, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil {
++		return false
++	}
++	if ip := net.ParseIP(h); ip == nil || !ip.IsLoopback() {
++		return false
++	}
++	for _, k := range []string{"X-Forwarded-For", "Forwarded", "X-Real-Ip",
++		"Cf-Connecting-Ip", "True-Client-Ip", "X-Forwarded-Host"} {
++		if r.Header.Get(k) != "" {
++			return false
++		}
++	}
++	return true
++}
++
++// limiterKey — ключ для ограничения перебора. За CDN берём ПОСЛЕДНИЙ элемент
++// X-Forwarded-For (его дописывает сам CDN; всё левее подделывает клиент).
++// Это работает, только если origin закрыт файрволом для всех, кроме CDN.
++func limiterKey(r *http.Request) string {
++	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
++		if i := strings.LastIndexByte(xff, ','); i >= 0 {
++			return strings.TrimSpace(xff[i+1:])
++		}
++		return strings.TrimSpace(xff)
++	}
++	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
++		return h
++	}
++	return r.RemoteAddr
++}
++
++// failGuard считает неверные ключи по адресу и банит перебор.
++type failGuard struct {
++	mu sync.Mutex
++	m  map[string]*failRec
++}
++
++type failRec struct {
++	n     int
++	first time.Time
++	until time.Time
++}
++
++func newFailGuard() *failGuard { return &failGuard{m: map[string]*failRec{}} }
++
++func (f *failGuard) blocked(k string, now time.Time) bool {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	r := f.m[k]
++	return r != nil && now.Before(r.until)
++}
++
++func (f *failGuard) fail(k string, now time.Time) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if len(f.m) >= maxGuardKeys {
++		for key, r := range f.m { // чистим устаревшее; при переполнении — любые
++			if now.After(r.until) && now.Sub(r.first) > authFailWindow {
++				delete(f.m, key)
++			}
++		}
++		if len(f.m) >= maxGuardKeys {
++			return
++		}
++	}
++	r := f.m[k]
++	if r == nil || now.Sub(r.first) > authFailWindow {
++		r = &failRec{first: now}
++		f.m[k] = r
++	}
++	r.n++
++	if r.n >= maxAuthFails {
++		r.until = now.Add(authBanTime)
++	}
++}
++
++func (f *failGuard) reset(k string) {
++	f.mu.Lock()
++	delete(f.m, k)
++	f.mu.Unlock()
++}
+diff --git a/hardening_test.go b/hardening_test.go
+new file mode 100644
+index 0000000..2df58b9
+--- /dev/null
++++ b/hardening_test.go
+@@ -0,0 +1,189 @@
++package main
++
++import (
++	"bytes"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestBlockedIP(t *testing.T) {
++	for _, s := range []string{"127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1",
++		"169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "224.0.0.1", "::ffff:127.0.0.1"} {
++		if !blockedIP(net.ParseIP(s)) {
++			t.Errorf("%s должен быть запрещён", s)
++		}
++	}
++	for _, s := range []string{"8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"} {
++		if blockedIP(net.ParseIP(s)) {
++			t.Errorf("%s не должен блокироваться", s)
++		}
++	}
++}
++
++// Владелец ходит куда угодно, ссылка — только наружу.
++func TestConnectSSRFPolicy(t *testing.T) {
++	st = &stats{}
++	echo := startEcho(t) // 127.0.0.1:port
++	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
++	post := func(link bool) int {
++		authToken = "мастер"
++		defer func() { authToken = "" }()
++		req := httptest.NewRequest(http.MethodPost, "/t/connect?id=x"+randID(), strings.NewReader(echo))
++		if !link {
++			req.Header.Set(authHeader, "мастер")
++		} else {
++			req.Header.Set(linkHeader, issueCred("мастер"))
++		}
++		w := httptest.NewRecorder()
++		ts.handleConnect(w, req)
++		return w.Code
++	}
++	if c := post(false); c != http.StatusOK {
++		t.Fatalf("владелец: %d, ожидался 200", c)
++	}
++	if c := post(true); c != http.StatusBadGateway {
++		t.Fatalf("ссылка → loopback: %d, ожидался 502", c)
++	}
++	allowPrivate = true
++	defer func() { allowPrivate = false }()
++	if c := post(true); c != http.StatusOK {
++		t.Fatalf("-allow-private: %d, ожидался 200", c)
++	}
++}
++
++func TestPayloadLimit(t *testing.T) {
++	big := bytes.Repeat([]byte("a"), maxPayload+1)
++	req := httptest.NewRequest(http.MethodPost, "/hello", bytes.NewReader(big))
++	if _, err := readPayload(req, qToken); err != errPayloadTooLarge {
++		t.Fatalf("err=%v, ожидалась errPayloadTooLarge", err)
++	}
++	ok := httptest.NewRequest(http.MethodPost, "/hello", bytes.NewReader(big[:1000]))
++	if b, err := readPayload(ok, qToken); err != nil || len(b) != 1000 {
++		t.Fatalf("нормальное тело: %d байт, err=%v", len(b), err)
++	}
++}
++
++func TestUpWindowAndDuplicates(t *testing.T) {
++	st = &stats{}
++	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
++	c1, c2 := net.Pipe()
++	defer c1.Close()
++	defer c2.Close()
++	s := &stream{id: "s", conn: c1, down: make(chan []byte, 1), done: make(chan struct{}), upBuf: map[uint64][]byte{}}
++	s.upCond = sync.NewCond(&s.upMu)
++	ts.streams["s"] = s
++	up := func(seq string, body string) int {
++		req := httptest.NewRequest(http.MethodPost, "/t/up?id=s&seq="+seq, strings.NewReader(body))
++		w := httptest.NewRecorder()
++		ts.handleUp(w, req)
++		return w.Code
++	}
++	if c := up("5000", "x"); c != http.StatusTooManyRequests {
++		t.Fatalf("seq далеко впереди окна: %d, ожидался 429", c)
++	}
++	if c := up("3", "x"); c != http.StatusOK {
++		t.Fatalf("seq в окне: %d", c)
++	}
++	s.upMu.Lock()
++	n, b := len(s.upBuf), s.upBytes
++	s.upMu.Unlock()
++	if n != 1 || b != 1 {
++		t.Fatalf("буфер: %d чанков, %d байт", n, b)
++	}
++	if c := up("3", "y"); c != http.StatusOK { // повтор того же seq
++		t.Fatalf("дубль: %d", c)
++	}
++	s.upMu.Lock()
++	n, b = len(s.upBuf), s.upBytes
++	s.upMu.Unlock()
++	if n != 1 || b != 1 {
++		t.Fatalf("дубль задвоил буфер: %d чанков, %d байт", n, b)
++	}
++	close(s.done)
++	s.upCond.Broadcast()
++}
++
++func TestNoStoreAndBanOnBruteforce(t *testing.T) {
++	authToken = "мастер"
++	defer func() { authToken = "" }()
++	srv, _ := linkServer(t)
++	get := func(key string) (*http.Response, int) {
++		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/hello", nil)
++		req.Header.Set(authHeader, key)
++		resp, err := srv.Client().Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		resp.Body.Close()
++		return resp, resp.StatusCode
++	}
++	resp, code := get("мастер")
++	if code != http.StatusOK || resp.Header.Get("Cache-Control") != "no-store" {
++		t.Fatalf("владелец: %d, Cache-Control=%q", code, resp.Header.Get("Cache-Control"))
++	}
++	for i := 0; i < maxAuthFails; i++ {
++		if _, c := get("не-то"); c != http.StatusNotFound {
++			t.Fatalf("неверный ключ: %d", c)
++		}
++	}
++	// Адрес в бане: даже верный ключ не проверяется.
++	if _, c := get("мастер"); c != http.StatusNotFound {
++		t.Fatalf("после бана верный ключ дал %d, ожидался 404", c)
++	}
++}
++
++func TestAdminOnlyFromLoopback(t *testing.T) {
++	authToken = "мастер"
++	defer func() { authToken = "" }()
++	mk := func(remote string, hdr ...string) *http.Request {
++		r := httptest.NewRequest(http.MethodGet, adminPath, nil)
++		r.RemoteAddr = remote
++		for i := 0; i+1 < len(hdr); i += 2 {
++			r.Header.Set(hdr[i], hdr[i+1])
++		}
++		return r
++	}
++	if !adminAllowed(mk("127.0.0.1:5555")) {
++		t.Error("localhost должен проходить")
++	}
++	if adminAllowed(mk("203.0.113.9:5555")) {
++		t.Error("внешний адрес не должен проходить")
++	}
++	if adminAllowed(mk("127.0.0.1:5555", "Cf-Connecting-Ip", "1.2.3.4")) {
++		t.Error("локальный прокси/туннель с заголовком CDN не должен проходить")
++	}
++	adminRemote = true
++	defer func() { adminRemote = false }()
++	if !adminAllowed(mk("203.0.113.9:5555")) {
++		t.Error("-admin-remote должен пускать")
++	}
++}
++
++func TestLimiterKeyUsesLastXFF(t *testing.T) {
++	r := httptest.NewRequest(http.MethodGet, "/", nil)
++	r.RemoteAddr = "198.51.100.1:1"
++	r.Header.Set("X-Forwarded-For", "6.6.6.6, 203.0.113.7")
++	if got := limiterKey(r); got != "203.0.113.7" {
++		t.Fatalf("limiterKey=%q, ожидался последний элемент XFF", got)
++	}
++}
++
++func TestFailGuardWindow(t *testing.T) {
++	g := newFailGuard()
++	now := time.Now()
++	for i := 0; i < maxAuthFails; i++ {
++		g.fail("a", now)
++	}
++	if !g.blocked("a", now.Add(time.Minute)) {
++		t.Fatal("должен быть забанен")
++	}
++	if g.blocked("a", now.Add(authBanTime+time.Second)) {
++		t.Fatal("бан должен истечь")
++	}
++	g.reset("a")
++}
+diff --git a/main.go b/main.go
+index a977a55..aaab89b 100644
+--- a/main.go
++++ b/main.go
+@@ -64,8 +64,22 @@ func main() {
+ 		device    = flag.String("device", "", "отпечаток устройства для привязки ссылки (по умолчанию определяется сам)")
+ 		cred      = flag.String("cred", "", "удостоверение ссылки <id>.<подпись> (режим -client; альтернатива -password)")
+ 		share     = flag.Bool("share", false, "напечатать cdn://-ссылку с текущими настройками и выйти")
++		allowPriv = flag.Bool("allow-private", false, "разрешить ссылкам ходить в loopback/частные сети сервера (по умолчанию — только владельцу)")
++		reqE2E    = flag.Bool("require-e2e", false, "сервер: принимать только клиентов со сквозным шифрованием (нужен -password)")
++		legacy    = flag.Bool("legacy", false, "клиент: без сквозного шифрования (совместимость со старым сервером; пароль/ссылка идут в заголовках)")
++		tlsFp     = flag.String("tls-fingerprint", "chrome", "клиент: TLS-отпечаток к CDN (chrome, firefox, safari, ios, edge, android, random, go — обычный TLS Go)")
++		adminRem  = flag.Bool("admin-remote", false, "пускать /admin не только с localhost (по умолчанию — только с самой машины)")
+ 	)
+ 	flag.Parse()
++	allowPrivate = *allowPriv
++	adminRemote = *adminRem
++	requireE2E = *reqE2E
++	clientLegacy = *legacy
++	tlsFingerprint = *tlsFp
++	if requireE2E && *pass == "" {
++		fmt.Println("✗ -require-e2e требует -password: без общего секрета шифровать не с чем")
++		os.Exit(1)
++	}
+ 
+ 	authToken = *pass
+ 	plainStats = *stats
+@@ -225,10 +239,16 @@ func methodAllowed(r *http.Request) bool {
+ // (base64url) для GET-режима, иначе из тела запроса (POST-режим).
+ func readPayload(r *http.Request, q string) ([]byte, error) {
+ 	if v := r.URL.Query().Get(q); v != "" {
++		if len(v) > maxPayload*4/3+4 {
++			return nil, errPayloadTooLarge
++		}
+ 		return base64.RawURLEncoding.DecodeString(v)
+ 	}
+-	b, err := io.ReadAll(r.Body)
++	b, err := io.ReadAll(io.LimitReader(r.Body, maxPayload+1))
+ 	r.Body.Close()
++	if err == nil && len(b) > maxPayload {
++		return nil, errPayloadTooLarge
++	}
+ 	return b, err
+ }
+ 
+@@ -421,11 +441,19 @@ type stream struct {
+ 	closeOnce sync.Once
+ 	lastAct   atomic.Int64 // время последней активности (UnixNano) — для реапа
+ 
+-	upMu    sync.Mutex
+-	upCond  *sync.Cond
+-	upBuf   map[uint64][]byte
+-	upNext  uint64
+-	upStart sync.Once // ленивый старт upWriter (только для chunked-режима)
++	upMu     sync.Mutex
++	upCond   *sync.Cond
++	upBuf    map[uint64][]byte
++	upNext   uint64
++	keys     *streamKeys // E2E-подключи (nil — старый режим без шифрования)
++	sess     *e2eSession // сессия-владелец стрима (только E2E)
++	dnCtr    atomic.Uint64
++	dn       *dnRing   // буфер последних отправленных вниз байт (resume после обрыва)
++	dnStart  sync.Once // ленивый старт dnFeeder
++	gate     *linkGate // для учёта трафика из dnFeeder (billKey уже вычислен в user)
++	upBytes  int       // байт лежит в upBuf (лимит maxUpBufBytes)
++	upStart  sync.Once // ленивый старт upWriter (только для chunked-режима)
++	upEOFSeq *uint64   // seq, на котором клиент сказал «дальше вверх ничего не будет» (под upMu)
+ }
+ 
+ func (s *stream) touch() { s.lastAct.Store(time.Now().UnixNano()) }
+@@ -465,6 +493,25 @@ func (s *stream) pumpTarget() {
+ 	}
+ }
+ 
++// dnFeeder разбирает поток pumpTarget (сырые байты цели) в записи на проводе
++// (шифрует при E2E) и копит их в кольце для resume. Отдельная горутина от
++// pumpTarget, чтобы медленный/переподключающийся down-GET не тормозил чтение
++// из цели — она продолжает копиться в канале s.down (буфер на 1024 чанка).
++func (s *stream) dnFeeder() {
++	for chunk := range s.down {
++		out := chunk
++		if s.keys != nil {
++			out = sealRecord(s.keys.down, s.dnCtr.Add(1)-1, []byte("dn|"+s.id), chunk)
++		}
++		st.down.Add(uint64(len(chunk)))
++		if s.gate != nil {
++			s.gate.addTraffic(s.user, 0, uint64(len(chunk)))
++		}
++		s.dn.append(out)
++	}
++	s.dn.closeRing()
++}
++
+ func (s *stream) upWriter() {
+ 	s.upMu.Lock()
+ 	defer s.upMu.Unlock()
+@@ -476,10 +523,18 @@ func (s *stream) upWriter() {
+ 		}
+ 		chunk, ok := s.upBuf[s.upNext]
+ 		if !ok {
++			if s.upEOFSeq != nil && *s.upEOFSeq == s.upNext {
++				s.upEOFSeq = nil // одноразово — halfCloseTarget сама идемпотентна, но не спамим
++				s.upMu.Unlock()
++				s.halfCloseTarget()
++				s.upMu.Lock()
++				continue
++			}
+ 			s.upCond.Wait()
+ 			continue
+ 		}
+ 		delete(s.upBuf, s.upNext)
++		s.upBytes -= len(chunk)
+ 		s.upNext++
+ 		s.upMu.Unlock()
+ 		_, err := s.conn.Write(chunk)
+@@ -491,6 +546,10 @@ func (s *stream) upWriter() {
+ }
+ 
+ type udpSession struct {
++	keys      *udpKeys
++	sess      *e2eSession
++	replay    replayWindow
++	dnCtr     atomic.Uint64
+ 	user      string // ключ слота клиента — кому писать трафик
+ 	id        string
+ 	pc        *net.UDPConn
+@@ -835,6 +894,8 @@ type linkGate struct {
+ 	lastLog map[string]time.Time // троттлинг журнала отказов: клиент ретраится
+ 	path    string               // файл состояния ("" — не сохранять)
+ 	dirty   bool                 // есть несохранённые счётчики трафика
++	guard   *failGuard           // бан перебора мастер-ключа/ссылки по адресу
++	sess    *sessionStore        // E2E-сессии
+ }
+ 
+ func newLinkGate() *linkGate {
+@@ -842,6 +903,8 @@ func newLinkGate() *linkGate {
+ 		links:   map[string]*linkRec{},
+ 		live:    map[string]*live{},
+ 		lastLog: map[string]time.Time{},
++		guard:   newFailGuard(),
++		sess:    newSessionStore(),
+ 	}
+ }
+ 
+@@ -895,6 +958,9 @@ func (g *linkGate) admit(r *http.Request) (key string, ok bool, why string) {
+ // billKey — ключ учёта запроса без побочных эффектов: им подписываются стримы,
+ // чтобы трафик лёг на нужную ссылку. Запрос к этому моменту уже пропущен admit.
+ func billKey(r *http.Request) string {
++	if es := sessFrom(r); es != nil {
++		return es.billKey()
++	}
+ 	if isOwner(r) {
+ 		return ownerKey
+ 	}
+@@ -1406,25 +1472,79 @@ func denyReply(w http.ResponseWriter, why string) {
+ // всем: сервер должен выглядеть обычным origin для CDN и сканеров.
+ func (g *linkGate) middleware(next http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		// CDN не должен кэшировать ни один ответ туннеля (особенно GET-режим).
++		w.Header().Set("Cache-Control", "no-store")
+ 		if r.URL.Path == "/" {
+ 			next.ServeHTTP(w, r)
+ 			return
+ 		}
+-		// Панель — только мастер-ключ: удостоверением ссылки не открывается и
+-		// на линии не учитывается, это не клиент туннеля.
++		lk := limiterKey(r)
++		if g.guard.blocked(lk, time.Now()) {
++			http.NotFound(w, r) // перебор: даже ключ не проверяем
++			return
++		}
++		// Рукопожатие сквозного шифрования: доступ проверяется внутри него, по PSK.
++		if r.URL.Path == "/hello" && r.Header.Get(kxHeader) != "" {
++			g.handleKx(w, r)
++			return
++		}
++		// Панель — только мастер-ключ и только с самой машины: удостоверением
++		// ссылки не открывается и на линии не учитывается, это не клиент туннеля.
+ 		if r.URL.Path == adminPath || strings.HasPrefix(r.URL.Path, adminPath+"/") {
++			if !adminAllowed(r) {
++				http.NotFound(w, r)
++				return
++			}
+ 			if !isOwner(r) {
+-				http.Error(w, denyForbidden, http.StatusForbidden)
++				g.guard.fail(lk, time.Now())
++				http.NotFound(w, r)
+ 				return
+ 			}
+ 			next.ServeHTTP(w, r)
+ 			return
+ 		}
++		// Запрос внутри E2E-сессии: секретов в заголовках нет, есть только sid.
++		if sid := r.Header.Get(sidHeader); sid != "" {
++			es := g.sess.get(sid, time.Now())
++			if es == nil {
++				http.NotFound(w, r) // сессии нет (рестарт/простой) — клиент пересоздаст
++				return
++			}
++			var key string
++			if es.owner {
++				key = ownerKey
++				g.seen(ownerKey, clientIP(r))
++			} else {
++				k, ok, why := g.useLink(es.linkID, es.device, clientIP(r))
++				if !ok {
++					denyReply(w, why)
++					return
++				}
++				key = k
++			}
++			if r.URL.Path == "/bye" {
++				g.release(key)
++				g.sess.drop(sid)
++			}
++			next.ServeHTTP(w, withSess(r, es))
++			return
++		}
++		if requireE2E {
++			http.NotFound(w, r) // без E2E-сессии — как чужой сайт
++			return
++		}
+ 		key, ok, why := g.admit(r)
+ 		if !ok {
++			if why == denyForbidden {
++				// Нет ни ключа, ни верной подписи: неотличимо от чужого сайта.
++				g.guard.fail(lk, time.Now())
++				http.NotFound(w, r)
++				return
++			}
+ 			denyReply(w, why)
+ 			return
+ 		}
++		g.guard.reset(lk)
+ 		if r.URL.Path == "/bye" {
+ 			g.release(key)
+ 		}
+@@ -1480,6 +1600,11 @@ func runServer(addr string) {
+ 	go gate.sweep()
+ 	if authToken != "" {
+ 		fmt.Printf("Доступ: мастер-ключ владельца или выпущенная ссылка (ссылка уходит с линии через %s молчания или по /bye).\n", linkTTL)
++		if requireE2E {
++			fmt.Println("Сквозное шифрование: обязательно (клиенты без E2E получают 404).")
++		} else {
++			fmt.Println("Сквозное шифрование: включено; старые клиенты без E2E пока принимаются (закрыть: -require-e2e).")
++		}
+ 	} else {
+ 		fmt.Println("ВНИМАНИЕ: мастер-ключ не задан (-password пуст) — туннель открыт для всех, кто знает адрес, и ссылки выпускать нечем.")
+ 	}
+@@ -1489,7 +1614,8 @@ func runServer(addr string) {
+ 		fmt.Printf("Реап простаивающих стримов: %s\n", idleTimeout)
+ 	}
+ 
+-	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 15 * time.Second}
++	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 15 * time.Second,
++		MaxHeaderBytes: 64 << 10, IdleTimeout: 120 * time.Second}
+ 	fmt.Printf("Туннель-сервер слушает %s\n", addr)
+ 	go st.render()
+ 	if err := srv.ListenAndServe(); err != nil {
+@@ -1527,7 +1653,11 @@ func handleHello(w http.ResponseWriter, r *http.Request) {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+-	body, _ := readPayload(r, qToken)
++	body, err := readPayload(r, qToken)
++	if err != nil || len(body) > 256 {
++		http.Error(w, "bad token", http.StatusBadRequest)
++		return
++	}
+ 	w.WriteHeader(http.StatusOK)
+ 	w.Write([]byte(helloPrefix + string(body)))
+ }
+@@ -1538,28 +1668,64 @@ func (t *tunnelServer) getStream(id string) *stream {
+ 	return t.streams[id]
+ }
+ 
++// streamFor находит стрим запроса; чужой сессии стрим не отдаётся.
++func (t *tunnelServer) streamFor(r *http.Request) *stream {
++	s := t.getStream(r.URL.Query().Get("id"))
++	if s != nil && s.sess != nil && s.sess != sessFrom(r) {
++		return nil
++	}
++	return s
++}
++
++func (t *tunnelServer) udpFor(r *http.Request) *udpSession {
++	u := t.udpGet(r.URL.Query().Get("id"))
++	if u != nil && u.sess != nil && u.sess != sessFrom(r) {
++		return nil
++	}
++	return u
++}
++
+ func (t *tunnelServer) handleConnect(w http.ResponseWriter, r *http.Request) {
+ 	if !methodAllowed(r) {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+ 	id := r.URL.Query().Get("id")
+-	body, _ := readPayload(r, qTarget)
++	body, err := readPayload(r, qTarget)
++	es := sessFrom(r)
++	var keys *streamKeys
++	if es != nil && err == nil {
++		keys = deriveStreamKeys(es.c2s, es.s2c, id)
++		body, err = keys.connect.Open(nil, nonceFor(0), body, []byte("cn|"+id))
++	} else if requireE2E {
++		err = errKx
++	}
+ 	target := string(body)
+-	if id == "" || target == "" {
++	if err != nil || id == "" || target == "" || len(target) > 300 {
+ 		http.Error(w, "id and target required", http.StatusBadRequest)
+ 		return
+ 	}
+-	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
++	if t.getStream(id) != nil {
++		http.Error(w, "stream exists", http.StatusConflict) // повтор connect
++		return
++	}
++	owner := billKey(r) == ownerKey
++	conn, err := targetDialer(owner).Dial("tcp", target)
+ 	if err != nil {
+ 		http.Error(w, "dial failed", http.StatusBadGateway)
+ 		return
+ 	}
+ 	tuneConn(conn)
+-	s := &stream{user: billKey(r), id: id, conn: conn, down: make(chan []byte, 1024), done: make(chan struct{}), upBuf: make(map[uint64][]byte)}
++	s := &stream{user: billKey(r), id: id, conn: conn, down: make(chan []byte, 1024), done: make(chan struct{}), upBuf: make(map[uint64][]byte), keys: keys, sess: es, dn: &dnRing{}, gate: t.gate}
+ 	s.upCond = sync.NewCond(&s.upMu)
+ 	s.touch()
+ 	t.mu.Lock()
++	if _, dup := t.streams[id]; dup {
++		t.mu.Unlock()
++		conn.Close()
++		http.Error(w, "stream exists", http.StatusConflict)
++		return
++	}
+ 	t.streams[id] = s
+ 	t.mu.Unlock()
+ 	st.conns.Add(1)
+@@ -1578,14 +1744,18 @@ func (t *tunnelServer) handleUpStream(w http.ResponseWriter, r *http.Request) {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+-	s := t.getStream(r.URL.Query().Get("id"))
++	s := t.streamFor(r)
+ 	if s == nil {
+ 		http.Error(w, "no stream", http.StatusNotFound)
+ 		return
+ 	}
++	var body io.Reader = r.Body
++	if s.keys != nil {
++		body = newOpenReader(r.Body, s.keys.ups, "ups|"+s.id)
++	}
+ 	buf := make([]byte, 64*1024)
+ 	for {
+-		n, err := r.Body.Read(buf)
++		n, err := body.Read(buf)
+ 		if n > 0 {
+ 			s.touch()
+ 			st.up.Add(uint64(n))
+@@ -1595,6 +1765,12 @@ func (t *tunnelServer) handleUpStream(w http.ResponseWriter, r *http.Request) {
+ 			}
+ 		}
+ 		if err != nil {
++			if err == io.EOF {
++				// Локальное приложение аккуратно закончило запрос — сообщаем
++				// цели тем же способом (TCP FIN на запись), не трогая чтение:
++				// она может успеть ответить прежде чем стрим закроют целиком.
++				s.halfCloseTarget()
++			}
+ 			break
+ 		}
+ 	}
+@@ -1622,42 +1798,82 @@ func (t *tunnelServer) reaper() {
+ 	}
+ }
+ 
++// handleDown отдаёт вниз то, что накопил dnFeeder в s.dn, начиная с байта
++// ?from=<offset> (используется при переподключении после обрыва), либо с
++// текущего конца потока, если from не задан (первое подключение). Диапазон
++// старше maxDownRingBytes уже вытеснен — тогда отвечаем 410: восстановить
++// нечем, клиенту придётся поднимать стрим заново.
+ func (t *tunnelServer) handleDown(w http.ResponseWriter, r *http.Request) {
+-	s := t.getStream(r.URL.Query().Get("id"))
++	s := t.streamFor(r)
+ 	if s == nil {
+ 		http.Error(w, "no stream", http.StatusNotFound)
+ 		return
+ 	}
++	s.dnStart.Do(func() { go s.dnFeeder() })
+ 	flusher, ok := w.(http.Flusher)
+ 	if !ok {
+ 		http.Error(w, "no flusher", http.StatusInternalServerError)
+ 		return
+ 	}
++	var pos uint64
++	if v := r.URL.Query().Get("from"); v != "" {
++		p, err := strconv.ParseUint(v, 10, 64)
++		if err != nil {
++			http.Error(w, "bad from", http.StatusBadRequest)
++			return
++		}
++		pos = p
++	} else {
++		pos = s.dn.tail()
++	}
++	// Проверяем «эвиктнуто?» ДО заголовков — тогда можно честно ответить 410,
++	// а не тихо закрыть тело так, что клиент примет это за штатный конец
++	// потока. Если запас исчерпается уже ПОСЛЕ того как 200 ушёл (редко:
++	// значит клиент настолько отстаёт от цели, что 4 МиБ буфера не хватило,
++	// пока он читал) — соединение просто оборвётся тем же кодом, каким видит
++	// обрыв сети, и клиент честно даст ретраям кончиться, а не решит, что
++	// поток завершился штатно.
++	if _, _, gone, _, _ := s.dn.poll(pos); gone {
++		http.Error(w, "range gone", http.StatusGone)
++		return
++	}
+ 	w.Header().Set("Content-Type", "application/octet-stream")
+ 	w.Header().Set("X-Accel-Buffering", "no")
++	w.Header().Set("Trailer", downTruncatedTrailer) // редкий пост-200 gone — см. ниже
+ 	w.WriteHeader(http.StatusOK)
+ 	flusher.Flush()
+ 	for {
+-		select {
+-		case <-r.Context().Done():
++		data, end, gone, closed, wait := s.dn.poll(pos)
++		if gone {
++			// Заголовки уже ушли, статус не поменять — говорим клиенту трейлером,
++			// чтобы он не принял обрыв за штатный конец потока и продолжил ретраи.
++			w.Header().Set(downTruncatedTrailer, "1")
+ 			return
+-		case chunk, more := <-s.down:
+-			if !more {
+-				return
+-			}
+-			if _, err := w.Write(chunk); err != nil {
++		}
++		if len(data) > 0 {
++			if _, err := w.Write(data); err != nil {
+ 				return
+ 			}
+-			st.down.Add(uint64(len(chunk)))
+-			t.bill(s.user, 0, uint64(len(chunk)))
+ 			s.touch()
+ 			flusher.Flush()
++			pos = end
++			continue
++		}
++		if closed {
++			return // цель закрылась и все данные уже отданы — вниз больше нечего
++		}
++		select {
++		case <-r.Context().Done():
++			return
++		case <-s.done:
++			return
++		case <-wait:
+ 		}
+ 	}
+ }
+ 
+ func (t *tunnelServer) handleUp(w http.ResponseWriter, r *http.Request) {
+-	s := t.getStream(r.URL.Query().Get("id"))
++	s := t.streamFor(r)
+ 	if s == nil {
+ 		http.Error(w, "no stream", http.StatusNotFound)
+ 		return
+@@ -1671,14 +1887,49 @@ func (t *tunnelServer) handleUp(w http.ResponseWriter, r *http.Request) {
+ 		http.Error(w, "bad seq", http.StatusBadRequest)
+ 		return
+ 	}
+-	body, _ := readPayload(r, qData)
+-	st.up.Add(uint64(len(body)))
+-	t.bill(s.user, uint64(len(body)), 0)
++	eof := r.URL.Query().Get("eof") == "1"
++	body, err := readPayload(r, qData)
++	if err != nil {
++		http.Error(w, "bad payload", http.StatusRequestEntityTooLarge)
++		return
++	}
++	if s.keys != nil {
++		if body, err = s.keys.up.Open(nil, nonceFor(seq), body, upAAD(s.id, seq, eof)); err != nil {
++			http.Error(w, "bad record", http.StatusBadRequest)
++			return
++		}
++	}
+ 	s.touch()
+ 	s.upStart.Do(func() { go s.upWriter() }) // ленивый старт реассемблера
+ 	s.upMu.Lock()
+-	s.upBuf[seq] = body
+-	s.upCond.Signal()
++	if eof {
++		// AEAD выше уже подтвердил, что это НАСТОЯЩИЙ клиент (см. upAAD) —
++		// узел на пути без ключа не мог бы подделать этот флаг для seq. Само
++		// закрытие цели сделает upWriter, когда дойдёт до этого seq по
++		// порядку — раньше нельзя, иначе обгонит ещё не записанные данные.
++		sc := seq
++		s.upEOFSeq = &sc
++		s.upCond.Signal()
++		s.upMu.Unlock()
++		w.WriteHeader(http.StatusOK)
++		return
++	}
++	switch {
++	case seq < s.upNext:
++		// уже принятый чанк (повтор клиента) — идемпотентно отвечаем ОК
++	case seq-s.upNext >= maxUpAhead || s.upBytes+len(body) > maxUpBufBytes:
++		s.upMu.Unlock()
++		http.Error(w, "too far ahead", http.StatusTooManyRequests)
++		return
++	default:
++		if _, dup := s.upBuf[seq]; !dup {
++			s.upBuf[seq] = body
++			s.upBytes += len(body)
++			st.up.Add(uint64(len(body)))
++			t.bill(s.user, uint64(len(body)), 0)
++		}
++		s.upCond.Signal()
++	}
+ 	s.upMu.Unlock()
+ 	w.WriteHeader(http.StatusOK)
+ }
+@@ -1689,7 +1940,7 @@ func (t *tunnelServer) handleClose(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	id := r.URL.Query().Get("id")
+-	if s := t.getStream(id); s != nil {
++	if s := t.streamFor(r); s != nil {
+ 		s.shut()
+ 		t.mu.Lock()
+ 		delete(t.streams, id)
+@@ -1722,7 +1973,20 @@ func (t *tunnelServer) handleUDPOpen(w http.ResponseWriter, r *http.Request) {
+ 	pc.SetReadBuffer(4 << 20)
+ 	pc.SetWriteBuffer(4 << 20)
+ 	u := &udpSession{user: billKey(r), id: id, pc: pc, down: make(chan []byte, 4096), done: make(chan struct{})}
++	if es := sessFrom(r); es != nil {
++		u.sess, u.keys = es, deriveUDPKeys(es.c2s, es.s2c, id)
++	} else if requireE2E {
++		pc.Close()
++		http.NotFound(w, r)
++		return
++	}
+ 	t.mu.Lock()
++	if _, dup := t.udp[id]; dup {
++		t.mu.Unlock()
++		pc.Close()
++		http.Error(w, "udp session exists", http.StatusConflict)
++		return
++	}
+ 	t.udp[id] = u
+ 	t.mu.Unlock()
+ 	st.conns.Add(1)
+@@ -1732,7 +1996,7 @@ func (t *tunnelServer) handleUDPOpen(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ func (t *tunnelServer) handleUDPDown(w http.ResponseWriter, r *http.Request) {
+-	u := t.udpGet(r.URL.Query().Get("id"))
++	u := t.udpFor(r)
+ 	if u == nil {
+ 		http.Error(w, "no udp session", http.StatusNotFound)
+ 		return
+@@ -1754,7 +2018,11 @@ func (t *tunnelServer) handleUDPDown(w http.ResponseWriter, r *http.Request) {
+ 			if !more {
+ 				return
+ 			}
+-			if _, err := w.Write(frame); err != nil {
++			out := frame
++			if u.keys != nil {
++				out = sealRecord(u.keys.down, u.dnCtr.Add(1)-1, []byte("ud|"+u.id), frame)
++			}
++			if _, err := w.Write(out); err != nil {
+ 				return
+ 			}
+ 			t.bill(u.user, 0, uint64(len(frame)))
+@@ -1768,15 +2036,33 @@ func (t *tunnelServer) handleUDPSend(w http.ResponseWriter, r *http.Request) {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+-	u := t.udpGet(r.URL.Query().Get("id"))
++	u := t.udpFor(r)
+ 	if u == nil {
+ 		http.Error(w, "no udp session", http.StatusNotFound)
+ 		return
+ 	}
+-	body, _ := readPayload(r, qData)
++	body, perr := readPayload(r, qData)
++	if perr != nil {
++		http.Error(w, "bad payload", http.StatusRequestEntityTooLarge)
++		return
++	}
++	if u.keys != nil {
++		if len(body) < 8 {
++			http.Error(w, "bad record", http.StatusBadRequest)
++			return
++		}
++		ctr := binary.BigEndian.Uint64(body[:8])
++		pt, err := u.keys.up.Open(nil, nonceFor(ctr), body[8:], []byte("uu|"+u.id))
++		if err != nil || !u.replay.accept(ctr) {
++			http.Error(w, "bad record", http.StatusBadRequest)
++			return
++		}
++		body = pt
++	}
++	owner := u.user == ownerKey
+ 	parseFrames(body, func(addr string, data []byte) {
+ 		ua, err := net.ResolveUDPAddr("udp", addr)
+-		if err != nil {
++		if err != nil || !udpTargetAllowed(ua, owner) {
+ 			return
+ 		}
+ 		u.pc.SetWriteDeadline(time.Now().Add(5 * time.Second))
+@@ -1795,7 +2081,12 @@ func (t *tunnelServer) handleUDPClose(w http.ResponseWriter, r *http.Request) {
+ 	id := r.URL.Query().Get("id")
+ 	t.mu.Lock()
+ 	u := t.udp[id]
+-	delete(t.udp, id)
++	if u != nil && u.sess != nil && u.sess != sessFrom(r) {
++		u = nil
++	}
++	if u != nil {
++		delete(t.udp, id)
++	}
+ 	t.mu.Unlock()
+ 	if u != nil {
+ 		u.shut()
+@@ -1806,11 +2097,22 @@ func (t *tunnelServer) handleUDPClose(w http.ResponseWriter, r *http.Request) {
+ 
+ // ============================ КЛИЕНТ ============================
+ 
++// clientSess — E2E-сессия текущего запуска клиента (nil — старый режим).
++var clientSess atomic.Pointer[clientSession]
++
++// udpClientKeys — подключи UDP-сессии клиента и счётчик пачек.
++type udpClientKeys struct {
++	keys *udpKeys
++	ctr  atomic.Uint64
++}
++
+ type tunnelClient struct {
+-	pool []*http.Client // пул независимых TCP/h2-соединений к CDN
+-	rr   atomic.Uint32  // round-robin счётчик
+-	base string
+-	udp  bool
++	keys  sync.Map       // id стрима → *streamKeys (E2E)
++	ukeys sync.Map       // id UDP-сессии → *udpClientKeys (E2E)
++	pool  []*http.Client // пул независимых TCP/h2-соединений к CDN
++	rr    atomic.Uint32  // round-robin счётчик
++	base  string
++	udp   bool
+ }
+ 
+ // pick выбирает следующий клиент из пула (round-robin).
+@@ -1849,12 +2151,18 @@ type authRoundTripper struct {
+ }
+ 
+ func (a authRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+-	if authToken != "" {
+-		r.Header.Set(authHeader, authToken)
+-	}
+-	if linkCred != "" {
+-		r.Header.Set(linkHeader, linkCred)
+-		r.Header.Set(deviceHeader, deviceID) // к нему сервер привяжет ссылку
++	if r.Header.Get(kxHeader) != "" {
++		// рукопожатие E2E: секретов в заголовках нет вообще
++	} else if cs := clientSess.Load(); cs != nil {
++		r.Header.Set(sidHeader, cs.sid) // внутри E2E-сессии — только sid
++	} else {
++		if authToken != "" {
++			r.Header.Set(authHeader, authToken)
++		}
++		if linkCred != "" {
++			r.Header.Set(linkHeader, linkCred)
++			r.Header.Set(deviceHeader, deviceID) // к нему сервер привяжет ссылку
++		}
+ 	}
+ 	id := a.id
+ 	if id == "" {
+@@ -1875,7 +2183,7 @@ func runClient(listen, ip, host string, conns int, udp bool) {
+ 	}
+ 	tc := &tunnelClient{base: "https://" + host, udp: udp}
+ 	for i := 0; i < conns; i++ {
+-		tc.pool = append(tc.pool, cdnClient(ip, host))
++		tc.pool = append(tc.pool, buildCDNClient(ip, host))
+ 	}
+ 
+ 	// hello-рукопожатие: убеждаемся, что достучались именно до нашего сервера.
+@@ -1883,7 +2191,7 @@ func runClient(listen, ip, host string, conns int, udp bool) {
+ 	if clientTransport == "chunked" {
+ 		upDesc = "chunked/" + clientMethod
+ 	}
+-	fmt.Printf("Подключение к серверу через CDN %s (Host %s), апстрим: %s, fastopen=%v...\n", ip, host, upDesc, fastOpen)
++	fmt.Printf("Подключение к серверу через CDN %s (Host %s), апстрим: %s, fastopen=%v, TLS-отпечаток: %s...\n", ip, host, upDesc, fastOpen, tlsFingerprint)
+ 	if err := tc.hello(); err != nil {
+ 		fmt.Printf("✗ Не удалось подключиться: %v\n", err)
+ 		fmt.Println("  Проверьте, что сервер запущен (go run main.go -server), IP/host и пароль верны.")
+@@ -1931,6 +2239,10 @@ func runClient(listen, ip, host string, conns int, udp bool) {
+ 	for {
+ 		conn, err := ln.Accept()
+ 		if err != nil {
++			if errors.Is(err, net.ErrClosed) {
++				return
++			}
++			time.Sleep(50 * time.Millisecond) // не крутить CPU при постоянной ошибке
+ 			continue
+ 		}
+ 		go tc.handleSocks(conn)
+@@ -1941,6 +2253,14 @@ func runClient(listen, ip, host string, conns int, udp bool) {
+ // методом: POST кладёт нагрузку в тело, GET — base64url в query-параметр
+ // payloadParam. Заголовок с паролем добавляет authRoundTripper.
+ func (tc *tunnelClient) doReq(ctx context.Context, hc *http.Client, path string, q url.Values, payloadParam string, payload []byte) (*http.Response, error) {
++	return tc.doReqH(ctx, hc, path, q, payloadParam, payload, nil)
++}
++
++// doReqH — doReq с дополнительными заголовками.
++func (tc *tunnelClient) doReqH(ctx context.Context, hc *http.Client, path string, q url.Values, payloadParam string, payload []byte, hdr map[string]string) (*http.Response, error) {
++	if q == nil {
++		q = url.Values{}
++	}
+ 	u := tc.base + path
+ 	if clientMethod == "get" {
+ 		if payload != nil {
+@@ -1953,6 +2273,9 @@ func (tc *tunnelClient) doReq(ctx context.Context, hc *http.Client, path string,
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		for k, v := range hdr {
++			req.Header.Set(k, v)
++		}
+ 		return hc.Do(req)
+ 	}
+ 	if len(q) > 0 {
+@@ -1969,6 +2292,9 @@ func (tc *tunnelClient) doReq(ctx context.Context, hc *http.Client, path string,
+ 	if payload != nil {
+ 		req.Header.Set("Content-Type", "application/octet-stream")
+ 	}
++	for k, v := range hdr {
++		req.Header.Set(k, v)
++	}
+ 	return hc.Do(req)
+ }
+ 
+@@ -1983,8 +2309,12 @@ type deny struct {
+ // текстом (см. denyReply), и это единственное место, где она разбирается.
+ func denyReason(code int, body string) (deny, bool) {
+ 	switch {
++	case strings.Contains(body, denyClock):
++		return deny{"clockskew", "часы устройства сильно расходятся с часами сервера — поправьте время"}, true
+ 	case code == http.StatusConflict || strings.Contains(body, denyUsed):
+ 		return deny{"linkused", "ссылка уже используется на другом устройстве — попросите владельца отвязать её или выдать новую"}, true
++	case code == http.StatusNotFound && strings.Contains(body, "page not found"):
++		// сервер маскируется под обычный сайт: «нет доступа» приходит как 404
+ 	case code != http.StatusForbidden:
+ 		return deny{}, false
+ 	case strings.Contains(body, denyUnknown):
+@@ -1995,10 +2325,56 @@ func denyReason(code int, body string) (deny, bool) {
+ 	if linkCred != "" {
+ 		return deny{"linkbad", "сервер не принял ссылку — возможно, она выпущена для другого сервера"}, true
+ 	}
+-	return deny{"authfail", "неверный мастер-ключ (сервер вернул 403)"}, true
++	return deny{"authfail", "неверный мастер-ключ (сервер вернул 403/404)"}, true
++}
++
++// helloE2E — рукопожатие со сквозным шифрованием вместо пароля в заголовках.
++func (tc *tunnelClient) helloE2E() error {
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	start := time.Now()
++	cs, err := tc.clientKx(ctx)
++	var d kxDeny
++	switch {
++	case errors.As(err, &d):
++		if why, bad := denyReason(http.StatusForbidden, d.reason); bad {
++			fmt.Println("STATUS " + why.status) // машиночитаемо для Android-обёртки
++			return errors.New(why.text)
++		}
++		return d
++	case errors.Is(err, errKx):
++		return fmt.Errorf("%v\n  Если сервер старой версии — обновите его или запустите клиент с -legacy (без шифрования)", err)
++	case err != nil:
++		return err
++	}
++	clientSess.Store(cs)
++	st.rttMs.Store(time.Since(start).Milliseconds())
++	return nil
++}
++
++// rekey пересоздаёт E2E-сессию, когда сервер её забыл (рестарт, простой).
++// Уже открытые стримы при этом теряются — их ключи принадлежали старой сессии.
++func (tc *tunnelClient) rekey() {
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	cs, err := tc.clientKx(ctx)
++	var d kxDeny
++	switch {
++	case err == nil:
++		clientSess.Store(cs)
++		logf("🔑 E2E-сессия пересоздана")
++	case errors.As(err, &d):
++		if why, bad := denyReason(http.StatusForbidden, d.reason); bad {
++			logf("⚠ %s", why.text)
++			fmt.Println("STATUS " + why.status)
++		}
++	}
+ }
+ 
+ func (tc *tunnelClient) hello() error {
++	if !clientLegacy && (authToken != "" || linkCred != "") {
++		return tc.helloE2E()
++	}
+ 	token := randID()
+ 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ 	defer cancel()
+@@ -2038,9 +2414,12 @@ func (tc *tunnelClient) keepWarm() {
+ 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+ 			resp.Body.Close()
+ 			tail := string(b)
+-			// Владелец мог удалить или отозвать ссылку уже после подключения:
+-			// замечаем это здесь и сообщаем обёртке, чтобы та погасила VPN.
+-			if why, bad := denyReason(resp.StatusCode, tail); bad {
++			// Сервер забыл E2E-сессию (рестарт/простой) — договариваемся заново.
++			if clientSess.Load() != nil && resp.StatusCode == http.StatusNotFound {
++				tc.rekey()
++			} else if why, bad := denyReason(resp.StatusCode, tail); bad {
++				// Владелец мог удалить или отозвать ссылку уже после подключения:
++				// замечаем это здесь и сообщаем обёртке, чтобы та погасила VPN.
+ 				logf("⚠ %s", why.text)
+ 				fmt.Println("STATUS " + why.status)
+ 			} else {
+@@ -2073,35 +2452,85 @@ func (tc *tunnelClient) bye() {
+ func (tc *tunnelClient) connect(hc *http.Client, id, target string) error {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+ 	defer cancel()
+-	resp, err := tc.doReq(ctx, hc, "/t/connect", url.Values{"id": {id}}, qTarget, []byte(target))
++	payload := []byte(target)
++	if cs := clientSess.Load(); cs != nil {
++		k := deriveStreamKeys(cs.c2s, cs.s2c, id)
++		tc.keys.Store(id, k)
++		payload = k.connect.Seal(nil, nonceFor(0), payload, []byte("cn|"+id))
++	}
++	resp, err := tc.doReq(ctx, hc, "/t/connect", url.Values{"id": {id}}, qTarget, payload)
+ 	if err != nil {
++		tc.keys.Delete(id)
+ 		return err
+ 	}
+ 	io.Copy(io.Discard, resp.Body)
+ 	resp.Body.Close()
+ 	if resp.StatusCode != http.StatusOK {
++		tc.keys.Delete(id)
+ 		return fmt.Errorf("connect status %d", resp.StatusCode)
+ 	}
+ 	return nil
+ }
+ 
++// up отправляет один chunk вверх с ретраями по СЕТЕВОЙ ошибке или 5xx/429:
++// сервер принимает повтор того же seq идемпотентно (handleUp), так что можно
++// смело слать один и тот же шифртекст ещё раз — ничего не задвоится. Ответы
++// вида 400/404/413 — протокольная ошибка (не то соединение/повреждённые
++// данные/лимит), повторять бессмысленно, отдаём её сразу.
+ func (tc *tunnelClient) up(hc *http.Client, id string, seq uint64, data []byte) error {
+-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+-	defer cancel()
+ 	q := url.Values{"id": {id}, "seq": {strconv.FormatUint(seq, 10)}}
++	if k := tc.streamKeysFor(id); k != nil {
++		data = k.up.Seal(nil, nonceFor(seq), data, upAAD(id, seq, false))
++	}
++	var lastErr error
++	backoff := 150 * time.Millisecond
++	for attempt := 0; attempt < maxUpRetries; attempt++ {
++		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++		resp, err := tc.doReq(ctx, hc, "/t/up", q, qData, data)
++		cancel()
++		if err != nil {
++			lastErr = err
++		} else {
++			io.Copy(io.Discard, resp.Body)
++			resp.Body.Close()
++			if resp.StatusCode == http.StatusOK {
++				return nil
++			}
++			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
++				return fmt.Errorf("up status %d", resp.StatusCode)
++			}
++			lastErr = fmt.Errorf("up status %d", resp.StatusCode)
++		}
++		if attempt < maxUpRetries-1 {
++			time.Sleep(backoff)
++			backoff = minDur(backoff*2, 3*time.Second)
++		}
++	}
++	return lastErr
++}
++
++// upEOF сообщает серверу, что вверх больше ничего не будет: seq — первый
++// НЕиспользованный номер (всё до него уже подтверждено доставленным). Сервер
++// применит его только когда реассемблер дойдёт до этого seq по порядку, так
++// что отправлять можно сразу после того как все чанки поставлены в очередь.
++func (tc *tunnelClient) upEOF(hc *http.Client, id string, seq uint64) {
++	var data []byte
++	if k := tc.streamKeysFor(id); k != nil {
++		data = k.up.Seal(nil, nonceFor(seq), nil, upAAD(id, seq, true))
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	q := url.Values{"id": {id}, "seq": {strconv.FormatUint(seq, 10)}, "eof": {"1"}}
+ 	resp, err := tc.doReq(ctx, hc, "/t/up", q, qData, data)
+ 	if err != nil {
+-		return err
++		return // не критично: полное закрытие всё равно придёт по /t/close
+ 	}
+ 	io.Copy(io.Discard, resp.Body)
+ 	resp.Body.Close()
+-	if resp.StatusCode != http.StatusOK {
+-		return fmt.Errorf("up status %d", resp.StatusCode)
+-	}
+-	return nil
+ }
+ 
+ func (tc *tunnelClient) closeStream(hc *http.Client, id string) {
++	defer tc.keys.Delete(id)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ 	defer cancel()
+ 	resp, err := tc.doReq(ctx, hc, "/t/close", url.Values{"id": {id}}, "", nil)
+@@ -2115,16 +2544,14 @@ func (tc *tunnelClient) relay(hc *http.Client, conn net.Conn, br io.Reader, id s
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+ 
+-	// Вниз: длинный потоковый ответ (одинаково в обоих транспортах).
++	// Вниз: длинный потоковый ответ, сам переподключается и продолжает с той
++	// же позиции при обрыве (см. relayDown в reliability.go) — независимо от
++	// апстрима, поэтому ждём его явно, а не рвём при завершении апстрима.
++	var down sync.WaitGroup
++	down.Add(1)
+ 	go func() {
+-		defer conn.Close()
+-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tc.base+"/t/down?id="+id, nil)
+-		resp, err := hc.Do(req)
+-		if err != nil {
+-			return
+-		}
+-		defer resp.Body.Close()
+-		io.Copy(countWriter{conn, &st.down}, resp.Body)
++		defer down.Done()
++		tc.relayDown(ctx, hc, conn, id)
+ 	}()
+ 
+ 	if clientTransport == "stream" {
+@@ -2132,8 +2559,86 @@ func (tc *tunnelClient) relay(hc *http.Client, conn net.Conn, br io.Reader, id s
+ 	} else {
+ 		tc.relayUpChunked(hc, br, id)
+ 	}
++	// Апстрим закончился (приложение больше не пишет) — это НЕ повод рвать
++	// скачивание ответа: ждём, пока сервер/цель сами не закроются или down
++	// не исчерпает лимит переподключений.
++	down.Wait()
+ 	tc.closeStream(hc, id)
+ 	cancel()
++	conn.Close()
++}
++
++// relayDown читает ответ сервера вниз, переподключаясь с точной позиции
++// resume при сетевом обрыве (см. dnRing на сервере). Не переподключается,
++// если сервер закрыл поток штатно, если локальный сокет мёртв (незачем — там
++// уже некому получать данные), либо если исчерпан лимит попыток.
++func (tc *tunnelClient) relayDown(ctx context.Context, hc *http.Client, conn net.Conn, id string) {
++	var pos uint64
++	first := true // только самый первый запрос идёт без from (пока нечего резюмировать)
++	fails := 0
++	backoff := 200 * time.Millisecond
++	for fails < maxDownReconnects {
++		select {
++		case <-ctx.Done():
++			return
++		default:
++		}
++		u := tc.base + "/t/down?id=" + id
++		if !first {
++			// ВАЖНО: pos==0 после неудачной(ых) попытки(ок) без прогресса —
++			// это ЗАКОННАЯ позиция «нужно с самого начала», а не «ничего не
++			// просили». Пропуск from здесь означал бы «дай хвост» и тихо
++			// терял бы уже накопленные в кольце байты.
++			u += "&from=" + strconv.FormatUint(pos, 10)
++		}
++		first = false
++		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
++		resp, err := hc.Do(req)
++		if err != nil {
++			if ctx.Err() != nil {
++				return
++			}
++			fails++
++			time.Sleep(backoff)
++			backoff = minDur(backoff*2, 5*time.Second)
++			continue
++		}
++		if resp.StatusCode == http.StatusGone {
++			resp.Body.Close() // диапазон эвикнут сервером — восполнить нечем
++			return
++		}
++		if resp.StatusCode != http.StatusOK {
++			resp.Body.Close()
++			if ctx.Err() != nil {
++				return
++			}
++			fails++
++			time.Sleep(backoff)
++			backoff = minDur(backoff*2, 5*time.Second)
++			continue
++		}
++		fails, backoff = 0, 200*time.Millisecond // соединение установлено — счётчик сбрасываем
++		reader := tc.wrapDown(id, resp.Body)
++		n, copyErr := copyDown(conn, reader)
++		truncated := resp.Trailer.Get(downTruncatedTrailer) != "" // см. handleDown
++		resp.Body.Close()
++		if r, ok := reader.(interface{ Consumed() uint64 }); ok {
++			pos = r.Consumed()
++		} else {
++			pos += n
++		}
++		switch {
++		case copyErr == errLocalClosed:
++			return // локальному приложению уже некуда писать
++		case copyErr == nil && !truncated:
++			return // сервер закрыл поток штатно (цель закрылась) — данных больше не будет
++		case ctx.Err() != nil:
++			return
++		}
++		fails++
++		time.Sleep(backoff)
++		backoff = minDur(backoff*2, 5*time.Second)
++	}
+ }
+ 
+ // relayUpStream — апстрим одним длинным POST: тело запроса читается прямо из
+@@ -2141,7 +2646,7 @@ func (tc *tunnelClient) relay(hc *http.Client, conn net.Conn, br io.Reader, id s
+ // Требует CDN, пропускающего streaming request body (иначе сервер не увидит
+ // байты до закрытия — используйте transport=chunked).
+ func (tc *tunnelClient) relayUpStream(ctx context.Context, hc *http.Client, br io.Reader, id string) {
+-	body := io.NopCloser(&countReader{r: br, c: &st.up})
++	body := io.NopCloser(tc.wrapUp(id, &countReader{r: br, c: &st.up}))
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tc.base+"/t/ups?id="+id, body)
+ 	if err != nil {
+ 		return
+@@ -2180,7 +2685,7 @@ func (tc *tunnelClient) streamWorks() bool {
+ 		}
+ 		defer resp.Body.Close()
+ 		b := make([]byte, 1)
+-		n, _ := resp.Body.Read(b)
++		n, _ := tc.wrapDown(id, resp.Body).Read(b)
+ 		gotDown <- n > 0
+ 	}()
+ 
+@@ -2190,7 +2695,7 @@ func (tc *tunnelClient) streamWorks() bool {
+ 		<-ctx.Done()
+ 		pw.Close()
+ 	}()
+-	upReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, tc.base+"/t/ups?id="+id, pr)
++	upReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, tc.base+"/t/ups?id="+id, io.NopCloser(tc.wrapUp(id, pr)))
+ 	upReq.Header.Set("Content-Type", "application/octet-stream")
+ 	go func() {
+ 		if resp, err := hc.Do(upReq); err == nil {
+@@ -2242,6 +2747,12 @@ func (tc *tunnelClient) relayUpChunked(hc *http.Client, br io.Reader, id string)
+ 		}
+ 	}
+ 	wg.Wait()
++	if !upErr.Load() {
++		// Чисто дочитали локальный ввод до EOF — говорим серверу, что вверх
++		// больше ничего не будет (он полу-закроет запись в цель), но само
++		// скачивание ответа при этом не трогаем (см. relayDown).
++		tc.upEOF(hc, id, seq)
++	}
+ }
+ 
+ // ============================ SOCKS5 ============================
+@@ -2353,6 +2864,9 @@ func (tc *tunnelClient) handleSocks(conn net.Conn) {
+ func (tc *tunnelClient) udpOpen(hc *http.Client, id string) error {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+ 	defer cancel()
++	if cs := clientSess.Load(); cs != nil {
++		tc.ukeys.Store(id, &udpClientKeys{keys: deriveUDPKeys(cs.c2s, cs.s2c, id)})
++	}
+ 	resp, err := tc.doReq(ctx, hc, "/u/open", url.Values{"id": {id}}, "", nil)
+ 	if err != nil {
+ 		return err
+@@ -2368,6 +2882,13 @@ func (tc *tunnelClient) udpOpen(hc *http.Client, id string) error {
+ func (tc *tunnelClient) udpSend(hc *http.Client, id string, frame []byte) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+ 	defer cancel()
++	if v, ok := tc.ukeys.Load(id); ok {
++		uk := v.(*udpClientKeys)
++		ctr := uk.ctr.Add(1) - 1
++		out := make([]byte, 8, 8+len(frame)+16)
++		binary.BigEndian.PutUint64(out, ctr)
++		frame = uk.keys.up.Seal(out, nonceFor(ctr), frame, []byte("uu|"+id))
++	}
+ 	resp, err := tc.doReq(ctx, hc, "/u/send", url.Values{"id": {id}}, qData, frame)
+ 	if err != nil {
+ 		return
+@@ -2377,6 +2898,7 @@ func (tc *tunnelClient) udpSend(hc *http.Client, id string, frame []byte) {
+ }
+ 
+ func (tc *tunnelClient) udpClose(hc *http.Client, id string) {
++	defer tc.ukeys.Delete(id)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+ 	defer cancel()
+ 	resp, err := tc.doReq(ctx, hc, "/u/close", url.Values{"id": {id}}, "", nil)
+@@ -2418,22 +2940,26 @@ func (tc *tunnelClient) handleUDPAssociate(conn net.Conn, hc *http.Client) {
+ 			return
+ 		}
+ 		defer resp.Body.Close()
++		var body io.Reader = resp.Body
++		if v, ok := tc.ukeys.Load(id); ok {
++			body = newOpenReader(resp.Body, v.(*udpClientKeys).keys.down, "ud|"+id)
++		}
+ 		h := make([]byte, 2)
+ 		for {
+-			if _, err := io.ReadFull(resp.Body, h); err != nil {
++			if _, err := io.ReadFull(body, h); err != nil {
+ 				return
+ 			}
+ 			al := binary.BigEndian.Uint16(h)
+ 			addr := make([]byte, al)
+-			if _, err := io.ReadFull(resp.Body, addr); err != nil {
++			if _, err := io.ReadFull(body, addr); err != nil {
+ 				return
+ 			}
+-			if _, err := io.ReadFull(resp.Body, h); err != nil {
++			if _, err := io.ReadFull(body, h); err != nil {
+ 				return
+ 			}
+ 			dl := binary.BigEndian.Uint16(h)
+ 			data := make([]byte, dl)
+-			if _, err := io.ReadFull(resp.Body, data); err != nil {
++			if _, err := io.ReadFull(body, data); err != nil {
+ 				return
+ 			}
+ 			if aa := appAddr.Load(); aa != nil {
+diff --git a/main_test.go b/main_test.go
+index 4b9a814..92c5685 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -325,8 +325,8 @@ func TestLinkRegistryIsAuthoritative(t *testing.T) {
+ 	}
+ 
+ 	// Подделка с неверной подписью — тоже мимо.
+-	if got := hello(t, srv, "deadbeef.00000000000000000000000000000000", "х"); got != http.StatusForbidden {
+-		t.Fatalf("поддельная ссылка: статус %d, ожидался 403", got)
++	if got := hello(t, srv, "deadbeef.00000000000000000000000000000000", "х"); got != http.StatusNotFound {
++		t.Fatalf("поддельная ссылка: статус %d, ожидался 404 (маскировка под обычный сайт)", got)
+ 	}
+ }
+ 
+@@ -422,8 +422,8 @@ func TestAdminNeedsMasterKey(t *testing.T) {
+ 	srv, _ := linkServer(t)
+ 	_, cred := newLink(t, srv, "Андрею")
+ 
+-	if code, _ := adminCall(t, srv, adminPath, false); code != http.StatusForbidden {
+-		t.Fatalf("панель без ключа: %d, ожидался 403", code)
++	if code, _ := adminCall(t, srv, adminPath, false); code != http.StatusNotFound {
++		t.Fatalf("панель без ключа: %d, ожидался 404", code)
+ 	}
+ 	req, _ := http.NewRequest(http.MethodGet, srv.URL+adminPath, nil)
+ 	req.Header.Set(linkHeader, cred)
+@@ -433,8 +433,8 @@ func TestAdminNeedsMasterKey(t *testing.T) {
+ 	}
+ 	io.Copy(io.Discard, resp.Body)
+ 	resp.Body.Close()
+-	if resp.StatusCode != http.StatusForbidden {
+-		t.Fatalf("панель по ссылке: %d, ожидался 403", resp.StatusCode)
++	if resp.StatusCode != http.StatusNotFound {
++		t.Fatalf("панель по ссылке: %d, ожидался 404", resp.StatusCode)
+ 	}
+ 	if code, body := adminCall(t, srv, adminPath, true); code != http.StatusOK || !strings.Contains(body, "Андрею") {
+ 		t.Fatalf("панель с ключом: %d %s", code, body)
+@@ -462,8 +462,8 @@ func TestOwnerUsesMasterKey(t *testing.T) {
+ 	if got := call("мастер"); got != http.StatusOK {
+ 		t.Fatalf("владелец: %d", got)
+ 	}
+-	if got := call("не-мастер"); got != http.StatusForbidden {
+-		t.Fatalf("неверный ключ: %d, ожидался 403", got)
++	if got := call("не-мастер"); got != http.StatusNotFound {
++		t.Fatalf("неверный ключ: %d, ожидался 404", got)
+ 	}
+ 	// Владелец на линии есть, но ссылкой не притворяется.
+ 	if _, ok := gate.live[ownerKey]; !ok {
+@@ -570,6 +570,8 @@ func TestDenyReason(t *testing.T) {
+ 		{"занятая ссылка", http.StatusConflict, denyUsed, "id.mac", "linkused", true},
+ 		{"чужой сервер", http.StatusForbidden, denyForbidden, "id.mac", "linkbad", true},
+ 		{"неверный мастер-ключ", http.StatusForbidden, denyForbidden, "", "authfail", true},
++		{"неверный ключ (404-маскировка)", http.StatusNotFound, "404 page not found\n", "", "authfail", true},
++		{"настоящий 404 стрима", http.StatusNotFound, "no stream", "", "", false},
+ 		{"всё в порядке", http.StatusOK, "hello", "", "", false},
+ 	}
+ 	for _, c := range cases {
+diff --git a/reliability.go b/reliability.go
+new file mode 100644
+index 0000000..d543b5c
+--- /dev/null
++++ b/reliability.go
+@@ -0,0 +1,160 @@
++package main
++
++// Надёжность транспорта: возобновляемая доставка вниз после обрыва долгого
++// GET (буферизующие/с таймаутом CDN рвут его регулярно), ретраи вверх с тем
++// же seq (сервер их и так принимает идемпотентно — см. handleUp), и
++// полу-закрытие: когда приложение закончило слать вверх, сервер закрывает
++// запись в цель, не обрывая при этом обратное чтение ответа.
++//
++// Полноценный мультиплекс многих логических стримов в одной сессии (вместо
++// отдельного X25519-рукопожатия на каждый SOCKS-коннект) в этот проход не
++// вошёл — это отдельная, более крупная переделка формата кадров поверх
++// стрима, а не улучшение поверх текущего. Здесь — только надёжность.
++
++import (
++	"errors"
++	"io"
++	"net"
++	"sync"
++	"time"
++)
++
++// Настраиваемые лимиты надёжности (var, а не const — тесты уменьшают их,
++// чтобы проверять редкие ветки вроде вытеснения из кольца, не гоняя мегабайты
++// данных по-настоящему).
++var (
++	// maxDownRingBytes — сколько последних байт вниз сервер держит в памяти
++	// на стрим ради возобновления после обрыва. Компромисс: больше — длиннее
++	// обрыв, который можно пережить без потери данных; но это память на
++	// каждый одновременный стрим.
++	maxDownRingBytes = 4 << 20
++
++	maxDownReconnects = 8 // сколько раз клиент переподключает down прежде чем сдаться
++	maxUpRetries      = 4 // сколько раз клиент повторяет один и тот же chunk вверх
++)
++
++const (
++	// downTruncatedTrailer — HTTP-трейлер: сервер эвиктнул часть данных уже
++	// ПОСЛЕ того, как отправил 200 (редкий путь — клиент сильно отстал).
++	// Статус к этому моменту не поменять, поэтому сигналим трейлером: иначе
++	// клиент видел бы чистый io.EOF и принял обрыв за штатный конец потока.
++	downTruncatedTrailer = "X-Cdn-Truncated"
++)
++
++// dnRing — буфер последних отправленных вниз байт с абсолютными смещениями.
++// Позволяет клиенту после обрыва GET попросить "/t/down?from=<offset>" и
++// получить то, что он не успел дочитать, не начиная стрим заново. Каждый
++// append — уже финальные байты на проводе (например, зашифрованная запись
++// целиком с её 4-байтовым префиксом длины), а не исходные данные цели: так
++// resume не требует ничего перешифровывать и не путает счётчики nonce.
++type dnRing struct {
++	mu      sync.Mutex
++	base    uint64 // абсолютное смещение первого байта в buf
++	buf     []byte
++	closed  bool
++	waiters []chan struct{}
++}
++
++func (r *dnRing) append(b []byte) {
++	if len(b) == 0 {
++		return
++	}
++	r.mu.Lock()
++	r.buf = append(r.buf, b...)
++	if excess := len(r.buf) - maxDownRingBytes; excess > 0 {
++		r.buf = r.buf[excess:]
++		r.base += uint64(excess)
++	}
++	ws := r.waiters
++	r.waiters = nil
++	r.mu.Unlock()
++	for _, w := range ws {
++		close(w)
++	}
++}
++
++func (r *dnRing) closeRing() {
++	r.mu.Lock()
++	r.closed = true
++	ws := r.waiters
++	r.waiters = nil
++	r.mu.Unlock()
++	for _, w := range ws {
++		close(w)
++	}
++}
++
++// tail — текущий конец буфера: с чего начинать, если клиент не просил resume.
++func (r *dnRing) tail() uint64 {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.base + uint64(len(r.buf))
++}
++
++// poll возвращает всё, что накопилось начиная с pos. Если там пока пусто и
++// поток жив — отдаёт канал wait, который закроется при новых данных, закрытии
++// или добавлении данных гонки не будет: регистрация ожидающего и проверка
++// делаются под одной блокировкой, что и append/closeRing.
++func (r *dnRing) poll(pos uint64) (data []byte, end uint64, gone, closed bool, wait <-chan struct{}) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	end = r.base + uint64(len(r.buf))
++	if pos < r.base {
++		return nil, end, true, false, nil
++	}
++	if end > pos {
++		return append([]byte(nil), r.buf[pos-r.base:]...), end, false, false, nil
++	}
++	if r.closed {
++		return nil, end, false, true, nil
++	}
++	ch := make(chan struct{})
++	r.waiters = append(r.waiters, ch)
++	return nil, end, false, false, ch
++}
++
++// halfCloseTarget закрывает запись в целевое соединение (TCP FIN на запись),
++// не трогая чтение — origin увидит конец запроса и сможет ответить, а стрим
++// продолжит получать вниз то, что тот пришлёт. Не все net.Conn это умеют
++// (например, TLS-обёртки без CloseWrite) — тогда просто не делаем ничего:
++// это не хуже прежнего поведения (полный конец придёт по /t/close или idle).
++func (s *stream) halfCloseTarget() {
++	if cw, ok := s.conn.(interface{ CloseWrite() error }); ok {
++		cw.CloseWrite()
++	}
++}
++
++// ---------------------------------------------------------------- клиент
++
++var errLocalClosed = errors.New("локальный сокет закрыт")
++
++// copyDown копирует src (ответ сервера, возможно уже расшифрованный) в conn
++// (локальное приложение), различая, где случилась ошибка: если сорвалась
++// ЗАПИСЬ в conn — переподключаться нет смысла, локальный сокет мёртв.
++func copyDown(conn net.Conn, src io.Reader) (uint64, error) {
++	var n uint64
++	buf := make([]byte, 32*1024)
++	for {
++		rn, rerr := src.Read(buf)
++		if rn > 0 {
++			if _, werr := conn.Write(buf[:rn]); werr != nil {
++				return n, errLocalClosed
++			}
++			n += uint64(rn)
++			st.down.Add(uint64(rn))
++		}
++		if rerr != nil {
++			if rerr == io.EOF {
++				return n, nil
++			}
++			return n, rerr
++		}
++	}
++}
++
++func minDur(a, b time.Duration) time.Duration {
++	if a < b {
++		return a
++	}
++	return b
++}
+diff --git a/reliability_test.go b/reliability_test.go
+new file mode 100644
+index 0000000..977161a
+--- /dev/null
++++ b/reliability_test.go
+@@ -0,0 +1,478 @@
++package main
++
++import (
++	"bytes"
++	"crypto/rand"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func resetReliabilityGlobals() {
++	maxDownRingBytes = 4 << 20
++	maxDownReconnects = 8
++	maxUpRetries = 4
++}
++
++// ---------------------------------------------------------------- dnRing
++
++func TestDnRingBasicFlow(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	r := &dnRing{}
++	// Пусто и не закрыто: poll(0) должен вернуть канал ожидания, не gone/closed.
++	data, end, gone, closed, wait := r.poll(0)
++	if len(data) != 0 || end != 0 || gone || closed || wait == nil {
++		t.Fatalf("пустое кольцо: data=%v end=%d gone=%v closed=%v wait=%v", data, end, gone, closed, wait)
++	}
++	r.append([]byte("hello"))
++	select {
++	case <-wait:
++	default:
++		t.Fatal("append должен разбудить уже зарегистрированного ожидающего")
++	}
++	data, end, gone, closed, _ = r.poll(0)
++	if string(data) != "hello" || end != 5 || gone || closed {
++		t.Fatalf("после append: %q %d %v %v", data, end, gone, closed)
++	}
++	// Частичное чтение с середины.
++	data, _, _, _, _ = r.poll(3)
++	if string(data) != "lo" {
++		t.Fatalf("poll(3) = %q, ожидалось \"lo\"", data)
++	}
++	r.append([]byte(" world"))
++	data, end, _, _, _ = r.poll(5)
++	if string(data) != " world" || end != 11 {
++		t.Fatalf("после второго append: %q %d", data, end)
++	}
++	r.closeRing()
++	_, _, gone, closed, wait = r.poll(11)
++	if gone || !closed || wait != nil {
++		t.Fatalf("на конце закрытого кольца: gone=%v closed=%v wait=%v", gone, closed, wait)
++	}
++}
++
++func TestDnRingEviction(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	maxDownRingBytes = 10
++	r := &dnRing{}
++	r.append([]byte("0123456789")) // ровно на весь буфер
++	r.append([]byte("ABCDE"))      // вытесняет первые 5 байт
++	data, end, gone, _, _ := r.poll(0)
++	if !gone {
++		t.Fatalf("байты 0..5 должны быть вытеснены, а poll(0) вернул %q (end=%d)", data, end)
++	}
++	data, end, gone, _, _ = r.poll(5)
++	if gone || string(data) != "56789ABCDE" || end != 15 {
++		t.Fatalf("poll(5) = %q %d gone=%v, ожидалось \"56789ABCDE\" 15 false", data, end, gone)
++	}
++}
++
++func TestDnRingWaiterRace(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	r := &dnRing{}
++	const n = 2000
++	var got []byte
++	var mu sync.Mutex
++	done := make(chan struct{})
++	go func() {
++		var pos uint64
++		for {
++			data, end, gone, closed, wait := r.poll(pos)
++			if gone {
++				t.Error("неожиданный gone")
++				close(done)
++				return
++			}
++			if len(data) > 0 {
++				mu.Lock()
++				got = append(got, data...)
++				mu.Unlock()
++				pos = end
++				continue
++			}
++			if closed {
++				close(done)
++				return
++			}
++			<-wait
++		}
++	}()
++	for i := 0; i < n; i++ {
++		r.append([]byte{byte(i)})
++	}
++	r.closeRing()
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		t.Fatal("таймаут — потребитель не догнал производителя")
++	}
++	if len(got) != n {
++		t.Fatalf("получено %d байт, ожидалось %d", len(got), n)
++	}
++	for i, b := range got {
++		if b != byte(i) {
++			t.Fatalf("байт %d = %d, ожидалось %d (порядок нарушен)", i, b, byte(i))
++		}
++	}
++}
++
++// ---------------------------------------------------------------- handleDown resume
++
++// newBareStream — минимальный stream для тестов handleDown без реального
++// сокета цели (conn нужен только тем путям, что явно тестируются).
++func newBareStream(id string) *stream {
++	s := &stream{id: id, done: make(chan struct{}), dn: &dnRing{}, down: make(chan []byte, 16)}
++	return s
++}
++
++func TestHandleDownResumeAfterClientDisconnect(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
++	s := newBareStream("r1")
++	ts.streams["r1"] = s
++	srv := httptest.NewServer(http.HandlerFunc(ts.handleDown))
++	defer srv.Close()
++
++	part1 := bytes.Repeat([]byte("A"), 100)
++	part2 := bytes.Repeat([]byte("B"), 100)
++	s.dn.append(part1)
++
++	// Первый запрос читает только part1, затем клиент «обрывается» —
++	// закрываем тело ответа раньше времени, не дожидаясь EOF.
++	resp, err := http.Get(srv.URL + "?id=r1&from=0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := make([]byte, len(part1))
++	if _, err := io.ReadFull(resp.Body, got); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(got, part1) {
++		t.Fatalf("part1 не совпал")
++	}
++	resp.Body.Close() // «обрыв соединения»
++
++	// Данные появляются уже после обрыва.
++	s.dn.append(part2)
++
++	// Второй запрос — с той же позиции, откуда оборвались.
++	resp2, err := http.Get(srv.URL + "?id=r1&from=" + strconv.Itoa(len(part1)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp2.Body.Close()
++	got2 := make([]byte, len(part2))
++	if _, err := io.ReadFull(resp2.Body, got2); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(got2, part2) {
++		t.Fatalf("part2 не совпал (данные потеряны или задвоены при resume)")
++	}
++}
++
++func TestHandleDownGoneBeforeHeaders(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	maxDownRingBytes = 10
++	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
++	s := newBareStream("r2")
++	ts.streams["r2"] = s
++	srv := httptest.NewServer(http.HandlerFunc(ts.handleDown))
++	defer srv.Close()
++
++	s.dn.append(bytes.Repeat([]byte("X"), 10))
++	s.dn.append(bytes.Repeat([]byte("Y"), 10)) // вытесняет всё, что было до этого
++
++	resp, err := http.Get(srv.URL + "?id=r2&from=0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusGone {
++		t.Fatalf("status=%d, ожидался 410 (диапазон уже вытеснен)", resp.StatusCode)
++	}
++}
++
++func TestHandleDownBadFrom(t *testing.T) {
++	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
++	s := newBareStream("r3")
++	ts.streams["r3"] = s
++	srv := httptest.NewServer(http.HandlerFunc(ts.handleDown))
++	defer srv.Close()
++	resp, err := http.Get(srv.URL + "?id=r3&from=не-число")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusBadRequest {
++		t.Fatalf("status=%d, ожидался 400", resp.StatusCode)
++	}
++}
++
++func TestHandleDownTruncationTrailer(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	maxDownRingBytes = 10
++	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
++	s := newBareStream("r4")
++	ts.streams["r4"] = s
++	srv := httptest.NewServer(http.HandlerFunc(ts.handleDown))
++	defer srv.Close()
++
++	s.dn.append([]byte("hi")) // проходит gone-проверку до заголовков (0 < base=0)
++
++	req, _ := http.NewRequest(http.MethodGet, srv.URL+"?id=r4&from=0", nil)
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status=%d, ожидался 200", resp.StatusCode)
++	}
++	// Пока хендлер ждёт продолжения, эвиктим всё вытеснением — это должно
++	// закрыть тело с трейлером, а не просто чисто оборваться.
++	go func() {
++		time.Sleep(100 * time.Millisecond)
++		s.dn.append(bytes.Repeat([]byte("Z"), 20)) // вытесняет "hi" и ещё сверху — pos=2 гарантированно попадает в вытесненное
++	}()
++	got, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("тело: %v", err)
++	}
++	if string(got) != "hi" {
++		t.Fatalf("тело=%q, ожидалось \"hi\"", got)
++	}
++	if resp.Trailer.Get(downTruncatedTrailer) == "" {
++		t.Fatal("ожидался трейлер об обрезанном потоке — клиент не должен принять это за штатный конец")
++	}
++}
++
++// ---------------------------------------------------------------- клиентский relayDown/up
++
++// flakyDownRT обрывает /t/down ответ после нескольких байт первые N раз, чтобы
++// проверить реальный reconnect клиента через настоящий HTTP-стек.
++type flakyDownRT struct {
++	base      http.RoundTripper
++	failFirst int32
++}
++
++type cutBody struct {
++	io.ReadCloser
++	n     int
++	after int
++}
++
++func (c *cutBody) Read(p []byte) (int, error) {
++	if c.n >= c.after {
++		return 0, io.ErrUnexpectedEOF
++	}
++	if len(p) > c.after-c.n {
++		p = p[:c.after-c.n]
++	}
++	n, err := c.ReadCloser.Read(p)
++	c.n += n
++	return n, err
++}
++
++func (f *flakyDownRT) RoundTrip(r *http.Request) (*http.Response, error) {
++	resp, err := f.base.RoundTrip(r)
++	if err != nil || !strings.Contains(r.URL.Path, "/t/down") {
++		return resp, err
++	}
++	if atomic.AddInt32(&f.failFirst, -1) >= 0 {
++		resp.Body = &cutBody{ReadCloser: resp.Body, after: 37} // произвольная маленькая граница
++	}
++	return resp, err
++}
++
++func TestClientResumesAfterRealDisconnect(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	for _, tr := range []string{"chunked", "stream"} {
++		for _, useE2E := range []bool{false, true} {
++			name := tr
++			if useE2E {
++				name += "-e2e"
++			}
++			t.Run(name, func(t *testing.T) {
++				resetReliabilityGlobals()
++				clientTransport, clientMethod, fastOpen = tr, "post", true
++				var tc *tunnelClient
++				var baseTransport http.RoundTripper
++				echoHost, echoPort := splitAddr(t, startEcho(t))
++				if useE2E {
++					e := newE2EEnv(t, "мастер-резюм")
++					tc = e.client()
++					if err := tc.helloE2E(); err != nil {
++						t.Fatal(err)
++					}
++					baseTransport = tc.pool[0].Transport
++				} else {
++					st = &stats{}
++					serverMethod = "both"
++					srv, hc := newTestServer(t)
++					tc = &tunnelClient{base: srv.URL, pool: []*http.Client{hc}}
++					baseTransport = hc.Transport
++				}
++				flaky := &flakyDownRT{base: baseTransport, failFirst: 3}
++				tc.pool[0] = &http.Client{Transport: flaky}
++
++				proxy, drain := socksProxy(t, tc)
++				app := socksConnect(t, proxy, echoHost, echoPort)
++				const size = 512 * 1024
++				payload := make([]byte, size)
++				rand.Read(payload)
++				go func() { app.Write(payload) }()
++				got := make([]byte, size)
++				if _, err := io.ReadFull(app, got); err != nil {
++					t.Fatalf("read: %v", err)
++				}
++				if !bytes.Equal(got, payload) {
++					t.Fatal("данные исказились после переподключений (потеря/задвоение/перестановка)")
++				}
++				app.Close()
++				drain()
++			})
++		}
++	}
++}
++
++// ---------------------------------------------------------------- up-ретраи
++
++func TestUpRetriesOnServerErrorNotOnBadRequest(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	maxUpRetries = 3
++	var calls int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		n := atomic.AddInt32(&calls, 1)
++		if n < 3 {
++			w.WriteHeader(http.StatusServiceUnavailable)
++			return
++		}
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer srv.Close()
++	tc := &tunnelClient{base: srv.URL}
++	clientMethod = "post"
++	if err := tc.up(srv.Client(), "x", 0, []byte("data")); err != nil {
++		t.Fatalf("после ретраев ожидался успех: %v", err)
++	}
++	if got := atomic.LoadInt32(&calls); got != 3 {
++		t.Fatalf("вызовов: %d, ожидалось 3 (2 неудачи + успех)", got)
++	}
++
++	atomic.StoreInt32(&calls, 0)
++	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		atomic.AddInt32(&calls, 1)
++		w.WriteHeader(http.StatusBadRequest)
++	}))
++	defer srv2.Close()
++	tc2 := &tunnelClient{base: srv2.URL}
++	if err := tc2.up(srv2.Client(), "x", 0, []byte("data")); err == nil {
++		t.Fatal("400 должен вернуть ошибку")
++	}
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("400 не должен повторяться, вызовов: %d", got)
++	}
++}
++
++// ---------------------------------------------------------------- half-close
++
++// startHalfCloseTarget — сервер, который читает вход до EOF (это и есть
++// половинное закрытие), затем один раз отвечает и держит соединение живым.
++func startHalfCloseTarget(t *testing.T) string {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { ln.Close() })
++	go func() {
++		c, err := ln.Accept()
++		if err != nil {
++			return
++		}
++		defer c.Close()
++		io.Copy(io.Discard, c) // ждём EOF на чтение
++		c.Write([]byte("реплика после половинного закрытия"))
++		time.Sleep(2 * time.Second)
++	}()
++	return ln.Addr().String()
++}
++
++func TestHalfCloseLetsTargetReply(t *testing.T) {
++	for _, tr := range []string{"chunked", "stream"} {
++		t.Run(tr, func(t *testing.T) {
++			resetReliabilityGlobals()
++			st = &stats{}
++			serverMethod, clientMethod, clientTransport, fastOpen = "both", "post", tr, true
++			srv, hc := newTestServer(t)
++			tc := &tunnelClient{base: srv.URL, pool: []*http.Client{hc}}
++			targetHost, targetPort := splitAddr(t, startHalfCloseTarget(t))
++
++			proxy, drain := socksProxy(t, tc)
++			app := socksConnect(t, proxy, targetHost, targetPort)
++
++			cw, ok := app.(interface{ CloseWrite() error })
++			if !ok {
++				t.Fatal("тестовое соединение не поддерживает половинное закрытие")
++			}
++			app.Write([]byte("запрос от приложения"))
++			if err := cw.CloseWrite(); err != nil {
++				t.Fatalf("CloseWrite: %v", err)
++			}
++			buf := make([]byte, 4096)
++			n, err := app.Read(buf)
++			if err != nil {
++				t.Fatalf("после половинного закрытия ответ не пришёл: %v", err)
++			}
++			if string(buf[:n]) != "реплика после половинного закрытия" {
++				t.Fatalf("ответ=%q", buf[:n])
++			}
++			app.Close()
++			drain()
++		})
++	}
++}
++
++func TestUpEOFAuthenticatedUnderE2E(t *testing.T) {
++	t.Cleanup(resetReliabilityGlobals)
++	e := newE2EEnv(t, "мастер-eof")
++	tc := e.client()
++	if err := tc.helloE2E(); err != nil {
++		t.Fatal(err)
++	}
++	echo := startEcho(t)
++	hc := tc.pool[0]
++	if err := tc.connect(hc, "eof1", echo); err != nil {
++		t.Fatal(err)
++	}
++	k := tc.streamKeysFor("eof1")
++	// Настоящий eof-маркер для seq=0 (никаких данных ещё не посылали).
++	realCT := k.up.Seal(nil, nonceFor(0), nil, upAAD("eof1", 0, true))
++	// Пытаемся подсунуть его как ОБЫЧНЫЙ чанк (eof=0 в URL) — AAD не совпадёт.
++	req, _ := http.NewRequest(http.MethodPost, e.srv.URL+"/t/up?id=eof1&seq=0", bytes.NewReader(realCT))
++	resp, err := hc.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusBadRequest {
++		t.Fatalf("eof-запись, поданная как обычный чанк: %d, ожидался 400 (узел не может просто дописать &eof=1 или снять его)", resp.StatusCode)
++	}
++	// А как настоящий eof-запрос — проходит.
++	req2, _ := http.NewRequest(http.MethodPost, e.srv.URL+"/t/up?id=eof1&seq=0&eof=1", bytes.NewReader(realCT))
++	resp2, err := hc.Do(req2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp2.Body.Close()
++	if resp2.StatusCode != http.StatusOK {
++		t.Fatalf("настоящий eof-маркер: %d", resp2.StatusCode)
++	}
++}

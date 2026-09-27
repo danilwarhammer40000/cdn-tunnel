@@ -41,7 +41,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
     private MaterialButton btnToggle, btnClear;
     private TextView tvStatus, tvStatusDetail, tvConn, tvLog, chevAdvanced, chevManual;
     private TextView tvProfile;
-    private MaterialButton btnImport, btnPaste, btnWipe;
+    private MaterialButton btnImport, btnPaste, btnWipe, btnAppSelect;
     private TextView tvDownTotal, tvDownRate, tvUpTotal, tvUpRate, tvConns, tvUdp, tvRtt;
     private LinearProgressIndicator progress;
     private NestedScrollView logScroll;
@@ -90,6 +90,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
         btnImport = findViewById(R.id.btn_import);
         btnPaste = findViewById(R.id.btn_paste);
         btnWipe = findViewById(R.id.btn_wipe);
+        btnAppSelect = findViewById(R.id.btn_app_select);
 
         tvDownTotal = findViewById(R.id.tv_down_total);
         tvDownRate = findViewById(R.id.tv_down_rate);
@@ -144,6 +145,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
         btnImport.setOnClickListener(v -> importLink(etLink.getText() == null ? "" : etLink.getText().toString()));
         btnPaste.setOnClickListener(v -> pasteLink());
         btnWipe.setOnClickListener(v -> wipeAll());
+        btnAppSelect.setOnClickListener(v -> startActivity(new Intent(this, AppSelectionActivity.class)));
         hdrManual.setOnClickListener(v -> {
             boolean show = boxManual.getVisibility() != View.VISIBLE;
             boxManual.setVisibility(show ? View.VISIBLE : View.GONE);
@@ -164,6 +166,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
         onPhase(TunState.phase(), TunState.phaseDetail());
         onRunningChanged(TunState.isRunning());
         renderStats(TunState.stats());
+        btnAppSelect.setText("Приложения в туннеле: " + AppSelectionStore.load(this).summary());
     }
 
     @Override protected void onPause() {

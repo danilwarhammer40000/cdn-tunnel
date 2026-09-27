@@ -325,8 +325,8 @@ func TestLinkRegistryIsAuthoritative(t *testing.T) {
 	}
 
 	// Подделка с неверной подписью — тоже мимо.
-	if got := hello(t, srv, "deadbeef.00000000000000000000000000000000", "х"); got != http.StatusForbidden {
-		t.Fatalf("поддельная ссылка: статус %d, ожидался 403", got)
+	if got := hello(t, srv, "deadbeef.00000000000000000000000000000000", "х"); got != http.StatusNotFound {
+		t.Fatalf("поддельная ссылка: статус %d, ожидался 404 (маскировка под обычный сайт)", got)
 	}
 }
 
@@ -422,8 +422,8 @@ func TestAdminNeedsMasterKey(t *testing.T) {
 	srv, _ := linkServer(t)
 	_, cred := newLink(t, srv, "Андрею")
 
-	if code, _ := adminCall(t, srv, adminPath, false); code != http.StatusForbidden {
-		t.Fatalf("панель без ключа: %d, ожидался 403", code)
+	if code, _ := adminCall(t, srv, adminPath, false); code != http.StatusNotFound {
+		t.Fatalf("панель без ключа: %d, ожидался 404", code)
 	}
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+adminPath, nil)
 	req.Header.Set(linkHeader, cred)
@@ -433,8 +433,8 @@ func TestAdminNeedsMasterKey(t *testing.T) {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("панель по ссылке: %d, ожидался 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("панель по ссылке: %d, ожидался 404", resp.StatusCode)
 	}
 	if code, body := adminCall(t, srv, adminPath, true); code != http.StatusOK || !strings.Contains(body, "Андрею") {
 		t.Fatalf("панель с ключом: %d %s", code, body)
@@ -462,8 +462,8 @@ func TestOwnerUsesMasterKey(t *testing.T) {
 	if got := call("мастер"); got != http.StatusOK {
 		t.Fatalf("владелец: %d", got)
 	}
-	if got := call("не-мастер"); got != http.StatusForbidden {
-		t.Fatalf("неверный ключ: %d, ожидался 403", got)
+	if got := call("не-мастер"); got != http.StatusNotFound {
+		t.Fatalf("неверный ключ: %d, ожидался 404", got)
 	}
 	// Владелец на линии есть, но ссылкой не притворяется.
 	if _, ok := gate.live[ownerKey]; !ok {
@@ -570,6 +570,8 @@ func TestDenyReason(t *testing.T) {
 		{"занятая ссылка", http.StatusConflict, denyUsed, "id.mac", "linkused", true},
 		{"чужой сервер", http.StatusForbidden, denyForbidden, "id.mac", "linkbad", true},
 		{"неверный мастер-ключ", http.StatusForbidden, denyForbidden, "", "authfail", true},
+		{"неверный ключ (404-маскировка)", http.StatusNotFound, "404 page not found\n", "", "authfail", true},
+		{"настоящий 404 стрима", http.StatusNotFound, "no stream", "", "", false},
 		{"всё в порядке", http.StatusOK, "hello", "", "", false},
 	}
 	for _, c := range cases {

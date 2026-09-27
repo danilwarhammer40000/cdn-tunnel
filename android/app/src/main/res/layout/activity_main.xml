@@ -107,6 +107,14 @@
                     android:textColor="?attr/colorOnSurfaceVariant"
                     android:paddingBottom="6dp" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_app_select"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent" android:layout_height="48dp"
+                    android:layout_marginBottom="10dp"
+                    android:text="Приложения в туннеле: все"
+                    app:icon="@drawable/ic_tab_link" app:cornerRadius="14dp" />
+
                 <!-- Ручная настройка (свёрнута: обычно хватает ссылки) -->
                 <LinearLayout
                     android:id="@+id/hdr_manual"

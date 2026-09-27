@@ -119,12 +119,7 @@ public class TunVpnService extends VpnService {
             if (cfg.dns != null && !cfg.dns.isEmpty()) {
                 b.addDnsServer(cfg.dns);
             }
-            // Наш собственный трафик (клиент туннеля к CDN) должен идти в обход VPN.
-            try {
-                b.addDisallowedApplication(getPackageName());
-            } catch (Exception e) {
-                TunState.log("[svc] disallow self не удался: " + e.getMessage());
-            }
+            applyAppSelection(b);
             b.setBlocking(false);
 
             vpnPfd = b.establish();
@@ -150,6 +145,51 @@ public class TunVpnService extends VpnService {
             TunState.log("[svc] ОШИБКА: " + t);
             TunState.setPhase(TunState.ERROR, String.valueOf(t.getMessage()));
             stopEverything();
+        }
+    }
+
+    /**
+     * Применяет выбор пользователя (экран «Приложения в туннеле») к builder'у TUN.
+     * Наш собственный трафик (клиент к CDN) всегда идёт в обход VPN — либо явным
+     * disallow, либо тем, что в режиме ONLY мы его просто никогда не add'им.
+     * addAllowedApplication и addDisallowedApplication нельзя смешивать — Android
+     * разрешает только один список на интерфейс, поэтому режимы взаимоисключающие.
+     */
+    private void applyAppSelection(Builder b) {
+        AppSelectionStore sel = AppSelectionStore.load(this);
+        String self = getPackageName();
+        if (sel.mode == AppSelectionStore.Mode.ALL || sel.packages.isEmpty()) {
+            if (sel.mode != AppSelectionStore.Mode.ALL) {
+                TunState.log("[svc] список приложений пуст — веду весь трафик, как в режиме «Все»");
+            }
+            try {
+                b.addDisallowedApplication(self);
+            } catch (Exception e) {
+                TunState.log("[svc] disallow self не удался: " + e.getMessage());
+            }
+            return;
+        }
+        int ok = 0;
+        for (String pkg : sel.packages) {
+            if (pkg.equals(self)) continue; // свой пакет и так не участвует
+            try {
+                if (sel.mode == AppSelectionStore.Mode.ONLY) b.addAllowedApplication(pkg);
+                else b.addDisallowedApplication(pkg);
+                ok++;
+            } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+                TunState.log("[svc] приложение " + pkg + " не найдено (удалено?) — пропускаю");
+            }
+        }
+        if (sel.mode == AppSelectionStore.Mode.EXCEPT) {
+            try {
+                b.addDisallowedApplication(self);
+            } catch (Exception e) {
+                TunState.log("[svc] disallow self не удался: " + e.getMessage());
+            }
+        }
+        TunState.log("[svc] режим приложений: " + sel.mode + ", в списке " + ok + " из " + sel.packages.size());
+        if (sel.mode == AppSelectionStore.Mode.ONLY && ok == 0) {
+            TunState.log("[svc] ⚠ ни одно выбранное приложение не найдено — через туннель не пойдёт ничего, кроме системного трафика");
         }
     }
 

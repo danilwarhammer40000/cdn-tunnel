@@ -6,6 +6,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Без этого на Android 11+ PackageManager не увидит чужие запускаемые
+         приложения — экран выбора «Приложения в туннеле» останется пустым. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -36,6 +45,12 @@
             android:name=".AdminActivity"
             android:exported="false"
             android:label="Управление сервером"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".AppSelectionActivity"
+            android:exported="false"
+            android:label="Приложения в туннеле"
             android:parentActivityName=".MainActivity" />
 
         <service

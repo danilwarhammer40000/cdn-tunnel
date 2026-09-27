@@ -64,8 +64,22 @@ func main() {
 		device    = flag.String("device", "", "отпечаток устройства для привязки ссылки (по умолчанию определяется сам)")
 		cred      = flag.String("cred", "", "удостоверение ссылки <id>.<подпись> (режим -client; альтернатива -password)")
 		share     = flag.Bool("share", false, "напечатать cdn://-ссылку с текущими настройками и выйти")
+		allowPriv = flag.Bool("allow-private", false, "разрешить ссылкам ходить в loopback/частные сети сервера (по умолчанию — только владельцу)")
+		reqE2E    = flag.Bool("require-e2e", false, "сервер: принимать только клиентов со сквозным шифрованием (нужен -password)")
+		legacy    = flag.Bool("legacy", false, "клиент: без сквозного шифрования (совместимость со старым сервером; пароль/ссылка идут в заголовках)")
+		tlsFp     = flag.String("tls-fingerprint", "chrome", "клиент: TLS-отпечаток к CDN (chrome, firefox, safari, ios, edge, android, random, go — обычный TLS Go)")
+		adminRem  = flag.Bool("admin-remote", false, "пускать /admin не только с localhost (по умолчанию — только с самой машины)")
 	)
 	flag.Parse()
+	allowPrivate = *allowPriv
+	adminRemote = *adminRem
+	requireE2E = *reqE2E
+	clientLegacy = *legacy
+	tlsFingerprint = *tlsFp
+	if requireE2E && *pass == "" {
+		fmt.Println("✗ -require-e2e требует -password: без общего секрета шифровать не с чем")
+		os.Exit(1)
+	}
 
 	authToken = *pass
 	plainStats = *stats
@@ -225,10 +239,16 @@ func methodAllowed(r *http.Request) bool {
 // (base64url) для GET-режима, иначе из тела запроса (POST-режим).
 func readPayload(r *http.Request, q string) ([]byte, error) {
 	if v := r.URL.Query().Get(q); v != "" {
+		if len(v) > maxPayload*4/3+4 {
+			return nil, errPayloadTooLarge
+		}
 		return base64.RawURLEncoding.DecodeString(v)
 	}
-	b, err := io.ReadAll(r.Body)
+	b, err := io.ReadAll(io.LimitReader(r.Body, maxPayload+1))
 	r.Body.Close()
+	if err == nil && len(b) > maxPayload {
+		return nil, errPayloadTooLarge
+	}
 	return b, err
 }
 
@@ -421,11 +441,19 @@ type stream struct {
 	closeOnce sync.Once
 	lastAct   atomic.Int64 // время последней активности (UnixNano) — для реапа
 
-	upMu    sync.Mutex
-	upCond  *sync.Cond
-	upBuf   map[uint64][]byte
-	upNext  uint64
-	upStart sync.Once // ленивый старт upWriter (только для chunked-режима)
+	upMu     sync.Mutex
+	upCond   *sync.Cond
+	upBuf    map[uint64][]byte
+	upNext   uint64
+	keys     *streamKeys // E2E-подключи (nil — старый режим без шифрования)
+	sess     *e2eSession // сессия-владелец стрима (только E2E)
+	dnCtr    atomic.Uint64
+	dn       *dnRing   // буфер последних отправленных вниз байт (resume после обрыва)
+	dnStart  sync.Once // ленивый старт dnFeeder
+	gate     *linkGate // для учёта трафика из dnFeeder (billKey уже вычислен в user)
+	upBytes  int       // байт лежит в upBuf (лимит maxUpBufBytes)
+	upStart  sync.Once // ленивый старт upWriter (только для chunked-режима)
+	upEOFSeq *uint64   // seq, на котором клиент сказал «дальше вверх ничего не будет» (под upMu)
 }
 
 func (s *stream) touch() { s.lastAct.Store(time.Now().UnixNano()) }
@@ -465,6 +493,25 @@ func (s *stream) pumpTarget() {
 	}
 }
 
+// dnFeeder разбирает поток pumpTarget (сырые байты цели) в записи на проводе
+// (шифрует при E2E) и копит их в кольце для resume. Отдельная горутина от
+// pumpTarget, чтобы медленный/переподключающийся down-GET не тормозил чтение
+// из цели — она продолжает копиться в канале s.down (буфер на 1024 чанка).
+func (s *stream) dnFeeder() {
+	for chunk := range s.down {
+		out := chunk
+		if s.keys != nil {
+			out = sealRecord(s.keys.down, s.dnCtr.Add(1)-1, []byte("dn|"+s.id), chunk)
+		}
+		st.down.Add(uint64(len(chunk)))
+		if s.gate != nil {
+			s.gate.addTraffic(s.user, 0, uint64(len(chunk)))
+		}
+		s.dn.append(out)
+	}
+	s.dn.closeRing()
+}
+
 func (s *stream) upWriter() {
 	s.upMu.Lock()
 	defer s.upMu.Unlock()
@@ -476,10 +523,18 @@ func (s *stream) upWriter() {
 		}
 		chunk, ok := s.upBuf[s.upNext]
 		if !ok {
+			if s.upEOFSeq != nil && *s.upEOFSeq == s.upNext {
+				s.upEOFSeq = nil // одноразово — halfCloseTarget сама идемпотентна, но не спамим
+				s.upMu.Unlock()
+				s.halfCloseTarget()
+				s.upMu.Lock()
+				continue
+			}
 			s.upCond.Wait()
 			continue
 		}
 		delete(s.upBuf, s.upNext)
+		s.upBytes -= len(chunk)
 		s.upNext++
 		s.upMu.Unlock()
 		_, err := s.conn.Write(chunk)
@@ -491,6 +546,10 @@ func (s *stream) upWriter() {
 }
 
 type udpSession struct {
+	keys      *udpKeys
+	sess      *e2eSession
+	replay    replayWindow
+	dnCtr     atomic.Uint64
 	user      string // ключ слота клиента — кому писать трафик
 	id        string
 	pc        *net.UDPConn
@@ -835,6 +894,8 @@ type linkGate struct {
 	lastLog map[string]time.Time // троттлинг журнала отказов: клиент ретраится
 	path    string               // файл состояния ("" — не сохранять)
 	dirty   bool                 // есть несохранённые счётчики трафика
+	guard   *failGuard           // бан перебора мастер-ключа/ссылки по адресу
+	sess    *sessionStore        // E2E-сессии
 }
 
 func newLinkGate() *linkGate {
@@ -842,6 +903,8 @@ func newLinkGate() *linkGate {
 		links:   map[string]*linkRec{},
 		live:    map[string]*live{},
 		lastLog: map[string]time.Time{},
+		guard:   newFailGuard(),
+		sess:    newSessionStore(),
 	}
 }
 
@@ -895,6 +958,9 @@ func (g *linkGate) admit(r *http.Request) (key string, ok bool, why string) {
 // billKey — ключ учёта запроса без побочных эффектов: им подписываются стримы,
 // чтобы трафик лёг на нужную ссылку. Запрос к этому моменту уже пропущен admit.
 func billKey(r *http.Request) string {
+	if es := sessFrom(r); es != nil {
+		return es.billKey()
+	}
 	if isOwner(r) {
 		return ownerKey
 	}
@@ -1406,25 +1472,79 @@ func denyReply(w http.ResponseWriter, why string) {
 // всем: сервер должен выглядеть обычным origin для CDN и сканеров.
 func (g *linkGate) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CDN не должен кэшировать ни один ответ туннеля (особенно GET-режим).
+		w.Header().Set("Cache-Control", "no-store")
 		if r.URL.Path == "/" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Панель — только мастер-ключ: удостоверением ссылки не открывается и
-		// на линии не учитывается, это не клиент туннеля.
+		lk := limiterKey(r)
+		if g.guard.blocked(lk, time.Now()) {
+			http.NotFound(w, r) // перебор: даже ключ не проверяем
+			return
+		}
+		// Рукопожатие сквозного шифрования: доступ проверяется внутри него, по PSK.
+		if r.URL.Path == "/hello" && r.Header.Get(kxHeader) != "" {
+			g.handleKx(w, r)
+			return
+		}
+		// Панель — только мастер-ключ и только с самой машины: удостоверением
+		// ссылки не открывается и на линии не учитывается, это не клиент туннеля.
 		if r.URL.Path == adminPath || strings.HasPrefix(r.URL.Path, adminPath+"/") {
+			if !adminAllowed(r) {
+				http.NotFound(w, r)
+				return
+			}
 			if !isOwner(r) {
-				http.Error(w, denyForbidden, http.StatusForbidden)
+				g.guard.fail(lk, time.Now())
+				http.NotFound(w, r)
 				return
 			}
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Запрос внутри E2E-сессии: секретов в заголовках нет, есть только sid.
+		if sid := r.Header.Get(sidHeader); sid != "" {
+			es := g.sess.get(sid, time.Now())
+			if es == nil {
+				http.NotFound(w, r) // сессии нет (рестарт/простой) — клиент пересоздаст
+				return
+			}
+			var key string
+			if es.owner {
+				key = ownerKey
+				g.seen(ownerKey, clientIP(r))
+			} else {
+				k, ok, why := g.useLink(es.linkID, es.device, clientIP(r))
+				if !ok {
+					denyReply(w, why)
+					return
+				}
+				key = k
+			}
+			if r.URL.Path == "/bye" {
+				g.release(key)
+				g.sess.drop(sid)
+			}
+			next.ServeHTTP(w, withSess(r, es))
+			return
+		}
+		if requireE2E {
+			http.NotFound(w, r) // без E2E-сессии — как чужой сайт
+			return
+		}
 		key, ok, why := g.admit(r)
 		if !ok {
+			if why == denyForbidden {
+				// Нет ни ключа, ни верной подписи: неотличимо от чужого сайта.
+				g.guard.fail(lk, time.Now())
+				http.NotFound(w, r)
+				return
+			}
 			denyReply(w, why)
 			return
 		}
+		g.guard.reset(lk)
 		if r.URL.Path == "/bye" {
 			g.release(key)
 		}
@@ -1480,6 +1600,11 @@ func runServer(addr string) {
 	go gate.sweep()
 	if authToken != "" {
 		fmt.Printf("Доступ: мастер-ключ владельца или выпущенная ссылка (ссылка уходит с линии через %s молчания или по /bye).\n", linkTTL)
+		if requireE2E {
+			fmt.Println("Сквозное шифрование: обязательно (клиенты без E2E получают 404).")
+		} else {
+			fmt.Println("Сквозное шифрование: включено; старые клиенты без E2E пока принимаются (закрыть: -require-e2e).")
+		}
 	} else {
 		fmt.Println("ВНИМАНИЕ: мастер-ключ не задан (-password пуст) — туннель открыт для всех, кто знает адрес, и ссылки выпускать нечем.")
 	}
@@ -1489,7 +1614,8 @@ func runServer(addr string) {
 		fmt.Printf("Реап простаивающих стримов: %s\n", idleTimeout)
 	}
 
-	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 15 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 15 * time.Second,
+		MaxHeaderBytes: 64 << 10, IdleTimeout: 120 * time.Second}
 	fmt.Printf("Туннель-сервер слушает %s\n", addr)
 	go st.render()
 	if err := srv.ListenAndServe(); err != nil {
@@ -1527,7 +1653,11 @@ func handleHello(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, _ := readPayload(r, qToken)
+	body, err := readPayload(r, qToken)
+	if err != nil || len(body) > 256 {
+		http.Error(w, "bad token", http.StatusBadRequest)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(helloPrefix + string(body)))
 }
@@ -1538,28 +1668,64 @@ func (t *tunnelServer) getStream(id string) *stream {
 	return t.streams[id]
 }
 
+// streamFor находит стрим запроса; чужой сессии стрим не отдаётся.
+func (t *tunnelServer) streamFor(r *http.Request) *stream {
+	s := t.getStream(r.URL.Query().Get("id"))
+	if s != nil && s.sess != nil && s.sess != sessFrom(r) {
+		return nil
+	}
+	return s
+}
+
+func (t *tunnelServer) udpFor(r *http.Request) *udpSession {
+	u := t.udpGet(r.URL.Query().Get("id"))
+	if u != nil && u.sess != nil && u.sess != sessFrom(r) {
+		return nil
+	}
+	return u
+}
+
 func (t *tunnelServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !methodAllowed(r) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	id := r.URL.Query().Get("id")
-	body, _ := readPayload(r, qTarget)
+	body, err := readPayload(r, qTarget)
+	es := sessFrom(r)
+	var keys *streamKeys
+	if es != nil && err == nil {
+		keys = deriveStreamKeys(es.c2s, es.s2c, id)
+		body, err = keys.connect.Open(nil, nonceFor(0), body, []byte("cn|"+id))
+	} else if requireE2E {
+		err = errKx
+	}
 	target := string(body)
-	if id == "" || target == "" {
+	if err != nil || id == "" || target == "" || len(target) > 300 {
 		http.Error(w, "id and target required", http.StatusBadRequest)
 		return
 	}
-	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if t.getStream(id) != nil {
+		http.Error(w, "stream exists", http.StatusConflict) // повтор connect
+		return
+	}
+	owner := billKey(r) == ownerKey
+	conn, err := targetDialer(owner).Dial("tcp", target)
 	if err != nil {
 		http.Error(w, "dial failed", http.StatusBadGateway)
 		return
 	}
 	tuneConn(conn)
-	s := &stream{user: billKey(r), id: id, conn: conn, down: make(chan []byte, 1024), done: make(chan struct{}), upBuf: make(map[uint64][]byte)}
+	s := &stream{user: billKey(r), id: id, conn: conn, down: make(chan []byte, 1024), done: make(chan struct{}), upBuf: make(map[uint64][]byte), keys: keys, sess: es, dn: &dnRing{}, gate: t.gate}
 	s.upCond = sync.NewCond(&s.upMu)
 	s.touch()
 	t.mu.Lock()
+	if _, dup := t.streams[id]; dup {
+		t.mu.Unlock()
+		conn.Close()
+		http.Error(w, "stream exists", http.StatusConflict)
+		return
+	}
 	t.streams[id] = s
 	t.mu.Unlock()
 	st.conns.Add(1)
@@ -1578,14 +1744,18 @@ func (t *tunnelServer) handleUpStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s := t.getStream(r.URL.Query().Get("id"))
+	s := t.streamFor(r)
 	if s == nil {
 		http.Error(w, "no stream", http.StatusNotFound)
 		return
 	}
+	var body io.Reader = r.Body
+	if s.keys != nil {
+		body = newOpenReader(r.Body, s.keys.ups, "ups|"+s.id)
+	}
 	buf := make([]byte, 64*1024)
 	for {
-		n, err := r.Body.Read(buf)
+		n, err := body.Read(buf)
 		if n > 0 {
 			s.touch()
 			st.up.Add(uint64(n))
@@ -1595,6 +1765,12 @@ func (t *tunnelServer) handleUpStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
+			if err == io.EOF {
+				// Локальное приложение аккуратно закончило запрос — сообщаем
+				// цели тем же способом (TCP FIN на запись), не трогая чтение:
+				// она может успеть ответить прежде чем стрим закроют целиком.
+				s.halfCloseTarget()
+			}
 			break
 		}
 	}
@@ -1622,42 +1798,82 @@ func (t *tunnelServer) reaper() {
 	}
 }
 
+// handleDown отдаёт вниз то, что накопил dnFeeder в s.dn, начиная с байта
+// ?from=<offset> (используется при переподключении после обрыва), либо с
+// текущего конца потока, если from не задан (первое подключение). Диапазон
+// старше maxDownRingBytes уже вытеснен — тогда отвечаем 410: восстановить
+// нечем, клиенту придётся поднимать стрим заново.
 func (t *tunnelServer) handleDown(w http.ResponseWriter, r *http.Request) {
-	s := t.getStream(r.URL.Query().Get("id"))
+	s := t.streamFor(r)
 	if s == nil {
 		http.Error(w, "no stream", http.StatusNotFound)
 		return
 	}
+	s.dnStart.Do(func() { go s.dnFeeder() })
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "no flusher", http.StatusInternalServerError)
 		return
 	}
+	var pos uint64
+	if v := r.URL.Query().Get("from"); v != "" {
+		p, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			http.Error(w, "bad from", http.StatusBadRequest)
+			return
+		}
+		pos = p
+	} else {
+		pos = s.dn.tail()
+	}
+	// Проверяем «эвиктнуто?» ДО заголовков — тогда можно честно ответить 410,
+	// а не тихо закрыть тело так, что клиент примет это за штатный конец
+	// потока. Если запас исчерпается уже ПОСЛЕ того как 200 ушёл (редко:
+	// значит клиент настолько отстаёт от цели, что 4 МиБ буфера не хватило,
+	// пока он читал) — соединение просто оборвётся тем же кодом, каким видит
+	// обрыв сети, и клиент честно даст ретраям кончиться, а не решит, что
+	// поток завершился штатно.
+	if _, _, gone, _, _ := s.dn.poll(pos); gone {
+		http.Error(w, "range gone", http.StatusGone)
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Trailer", downTruncatedTrailer) // редкий пост-200 gone — см. ниже
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	for {
+		data, end, gone, closed, wait := s.dn.poll(pos)
+		if gone {
+			// Заголовки уже ушли, статус не поменять — говорим клиенту трейлером,
+			// чтобы он не принял обрыв за штатный конец потока и продолжил ретраи.
+			w.Header().Set(downTruncatedTrailer, "1")
+			return
+		}
+		if len(data) > 0 {
+			if _, err := w.Write(data); err != nil {
+				return
+			}
+			s.touch()
+			flusher.Flush()
+			pos = end
+			continue
+		}
+		if closed {
+			return // цель закрылась и все данные уже отданы — вниз больше нечего
+		}
 		select {
 		case <-r.Context().Done():
 			return
-		case chunk, more := <-s.down:
-			if !more {
-				return
-			}
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
-			st.down.Add(uint64(len(chunk)))
-			t.bill(s.user, 0, uint64(len(chunk)))
-			s.touch()
-			flusher.Flush()
+		case <-s.done:
+			return
+		case <-wait:
 		}
 	}
 }
 
 func (t *tunnelServer) handleUp(w http.ResponseWriter, r *http.Request) {
-	s := t.getStream(r.URL.Query().Get("id"))
+	s := t.streamFor(r)
 	if s == nil {
 		http.Error(w, "no stream", http.StatusNotFound)
 		return
@@ -1671,14 +1887,49 @@ func (t *tunnelServer) handleUp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad seq", http.StatusBadRequest)
 		return
 	}
-	body, _ := readPayload(r, qData)
-	st.up.Add(uint64(len(body)))
-	t.bill(s.user, uint64(len(body)), 0)
+	eof := r.URL.Query().Get("eof") == "1"
+	body, err := readPayload(r, qData)
+	if err != nil {
+		http.Error(w, "bad payload", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if s.keys != nil {
+		if body, err = s.keys.up.Open(nil, nonceFor(seq), body, upAAD(s.id, seq, eof)); err != nil {
+			http.Error(w, "bad record", http.StatusBadRequest)
+			return
+		}
+	}
 	s.touch()
 	s.upStart.Do(func() { go s.upWriter() }) // ленивый старт реассемблера
 	s.upMu.Lock()
-	s.upBuf[seq] = body
-	s.upCond.Signal()
+	if eof {
+		// AEAD выше уже подтвердил, что это НАСТОЯЩИЙ клиент (см. upAAD) —
+		// узел на пути без ключа не мог бы подделать этот флаг для seq. Само
+		// закрытие цели сделает upWriter, когда дойдёт до этого seq по
+		// порядку — раньше нельзя, иначе обгонит ещё не записанные данные.
+		sc := seq
+		s.upEOFSeq = &sc
+		s.upCond.Signal()
+		s.upMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	switch {
+	case seq < s.upNext:
+		// уже принятый чанк (повтор клиента) — идемпотентно отвечаем ОК
+	case seq-s.upNext >= maxUpAhead || s.upBytes+len(body) > maxUpBufBytes:
+		s.upMu.Unlock()
+		http.Error(w, "too far ahead", http.StatusTooManyRequests)
+		return
+	default:
+		if _, dup := s.upBuf[seq]; !dup {
+			s.upBuf[seq] = body
+			s.upBytes += len(body)
+			st.up.Add(uint64(len(body)))
+			t.bill(s.user, uint64(len(body)), 0)
+		}
+		s.upCond.Signal()
+	}
 	s.upMu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
@@ -1689,7 +1940,7 @@ func (t *tunnelServer) handleClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
-	if s := t.getStream(id); s != nil {
+	if s := t.streamFor(r); s != nil {
 		s.shut()
 		t.mu.Lock()
 		delete(t.streams, id)
@@ -1722,7 +1973,20 @@ func (t *tunnelServer) handleUDPOpen(w http.ResponseWriter, r *http.Request) {
 	pc.SetReadBuffer(4 << 20)
 	pc.SetWriteBuffer(4 << 20)
 	u := &udpSession{user: billKey(r), id: id, pc: pc, down: make(chan []byte, 4096), done: make(chan struct{})}
+	if es := sessFrom(r); es != nil {
+		u.sess, u.keys = es, deriveUDPKeys(es.c2s, es.s2c, id)
+	} else if requireE2E {
+		pc.Close()
+		http.NotFound(w, r)
+		return
+	}
 	t.mu.Lock()
+	if _, dup := t.udp[id]; dup {
+		t.mu.Unlock()
+		pc.Close()
+		http.Error(w, "udp session exists", http.StatusConflict)
+		return
+	}
 	t.udp[id] = u
 	t.mu.Unlock()
 	st.conns.Add(1)
@@ -1732,7 +1996,7 @@ func (t *tunnelServer) handleUDPOpen(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *tunnelServer) handleUDPDown(w http.ResponseWriter, r *http.Request) {
-	u := t.udpGet(r.URL.Query().Get("id"))
+	u := t.udpFor(r)
 	if u == nil {
 		http.Error(w, "no udp session", http.StatusNotFound)
 		return
@@ -1754,7 +2018,11 @@ func (t *tunnelServer) handleUDPDown(w http.ResponseWriter, r *http.Request) {
 			if !more {
 				return
 			}
-			if _, err := w.Write(frame); err != nil {
+			out := frame
+			if u.keys != nil {
+				out = sealRecord(u.keys.down, u.dnCtr.Add(1)-1, []byte("ud|"+u.id), frame)
+			}
+			if _, err := w.Write(out); err != nil {
 				return
 			}
 			t.bill(u.user, 0, uint64(len(frame)))
@@ -1768,15 +2036,33 @@ func (t *tunnelServer) handleUDPSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	u := t.udpGet(r.URL.Query().Get("id"))
+	u := t.udpFor(r)
 	if u == nil {
 		http.Error(w, "no udp session", http.StatusNotFound)
 		return
 	}
-	body, _ := readPayload(r, qData)
+	body, perr := readPayload(r, qData)
+	if perr != nil {
+		http.Error(w, "bad payload", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if u.keys != nil {
+		if len(body) < 8 {
+			http.Error(w, "bad record", http.StatusBadRequest)
+			return
+		}
+		ctr := binary.BigEndian.Uint64(body[:8])
+		pt, err := u.keys.up.Open(nil, nonceFor(ctr), body[8:], []byte("uu|"+u.id))
+		if err != nil || !u.replay.accept(ctr) {
+			http.Error(w, "bad record", http.StatusBadRequest)
+			return
+		}
+		body = pt
+	}
+	owner := u.user == ownerKey
 	parseFrames(body, func(addr string, data []byte) {
 		ua, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
+		if err != nil || !udpTargetAllowed(ua, owner) {
 			return
 		}
 		u.pc.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -1795,7 +2081,12 @@ func (t *tunnelServer) handleUDPClose(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	t.mu.Lock()
 	u := t.udp[id]
-	delete(t.udp, id)
+	if u != nil && u.sess != nil && u.sess != sessFrom(r) {
+		u = nil
+	}
+	if u != nil {
+		delete(t.udp, id)
+	}
 	t.mu.Unlock()
 	if u != nil {
 		u.shut()
@@ -1806,11 +2097,22 @@ func (t *tunnelServer) handleUDPClose(w http.ResponseWriter, r *http.Request) {
 
 // ============================ КЛИЕНТ ============================
 
+// clientSess — E2E-сессия текущего запуска клиента (nil — старый режим).
+var clientSess atomic.Pointer[clientSession]
+
+// udpClientKeys — подключи UDP-сессии клиента и счётчик пачек.
+type udpClientKeys struct {
+	keys *udpKeys
+	ctr  atomic.Uint64
+}
+
 type tunnelClient struct {
-	pool []*http.Client // пул независимых TCP/h2-соединений к CDN
-	rr   atomic.Uint32  // round-robin счётчик
-	base string
-	udp  bool
+	keys  sync.Map       // id стрима → *streamKeys (E2E)
+	ukeys sync.Map       // id UDP-сессии → *udpClientKeys (E2E)
+	pool  []*http.Client // пул независимых TCP/h2-соединений к CDN
+	rr    atomic.Uint32  // round-robin счётчик
+	base  string
+	udp   bool
 }
 
 // pick выбирает следующий клиент из пула (round-robin).
@@ -1849,12 +2151,18 @@ type authRoundTripper struct {
 }
 
 func (a authRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	if authToken != "" {
-		r.Header.Set(authHeader, authToken)
-	}
-	if linkCred != "" {
-		r.Header.Set(linkHeader, linkCred)
-		r.Header.Set(deviceHeader, deviceID) // к нему сервер привяжет ссылку
+	if r.Header.Get(kxHeader) != "" {
+		// рукопожатие E2E: секретов в заголовках нет вообще
+	} else if cs := clientSess.Load(); cs != nil {
+		r.Header.Set(sidHeader, cs.sid) // внутри E2E-сессии — только sid
+	} else {
+		if authToken != "" {
+			r.Header.Set(authHeader, authToken)
+		}
+		if linkCred != "" {
+			r.Header.Set(linkHeader, linkCred)
+			r.Header.Set(deviceHeader, deviceID) // к нему сервер привяжет ссылку
+		}
 	}
 	id := a.id
 	if id == "" {
@@ -1875,7 +2183,7 @@ func runClient(listen, ip, host string, conns int, udp bool) {
 	}
 	tc := &tunnelClient{base: "https://" + host, udp: udp}
 	for i := 0; i < conns; i++ {
-		tc.pool = append(tc.pool, cdnClient(ip, host))
+		tc.pool = append(tc.pool, buildCDNClient(ip, host))
 	}
 
 	// hello-рукопожатие: убеждаемся, что достучались именно до нашего сервера.
@@ -1883,7 +2191,7 @@ func runClient(listen, ip, host string, conns int, udp bool) {
 	if clientTransport == "chunked" {
 		upDesc = "chunked/" + clientMethod
 	}
-	fmt.Printf("Подключение к серверу через CDN %s (Host %s), апстрим: %s, fastopen=%v...\n", ip, host, upDesc, fastOpen)
+	fmt.Printf("Подключение к серверу через CDN %s (Host %s), апстрим: %s, fastopen=%v, TLS-отпечаток: %s...\n", ip, host, upDesc, fastOpen, tlsFingerprint)
 	if err := tc.hello(); err != nil {
 		fmt.Printf("✗ Не удалось подключиться: %v\n", err)
 		fmt.Println("  Проверьте, что сервер запущен (go run main.go -server), IP/host и пароль верны.")
@@ -1931,6 +2239,10 @@ func runClient(listen, ip, host string, conns int, udp bool) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			time.Sleep(50 * time.Millisecond) // не крутить CPU при постоянной ошибке
 			continue
 		}
 		go tc.handleSocks(conn)
@@ -1941,6 +2253,14 @@ func runClient(listen, ip, host string, conns int, udp bool) {
 // методом: POST кладёт нагрузку в тело, GET — base64url в query-параметр
 // payloadParam. Заголовок с паролем добавляет authRoundTripper.
 func (tc *tunnelClient) doReq(ctx context.Context, hc *http.Client, path string, q url.Values, payloadParam string, payload []byte) (*http.Response, error) {
+	return tc.doReqH(ctx, hc, path, q, payloadParam, payload, nil)
+}
+
+// doReqH — doReq с дополнительными заголовками.
+func (tc *tunnelClient) doReqH(ctx context.Context, hc *http.Client, path string, q url.Values, payloadParam string, payload []byte, hdr map[string]string) (*http.Response, error) {
+	if q == nil {
+		q = url.Values{}
+	}
 	u := tc.base + path
 	if clientMethod == "get" {
 		if payload != nil {
@@ -1952,6 +2272,9 @@ func (tc *tunnelClient) doReq(ctx context.Context, hc *http.Client, path string,
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return nil, err
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
 		}
 		return hc.Do(req)
 	}
@@ -1969,6 +2292,9 @@ func (tc *tunnelClient) doReq(ctx context.Context, hc *http.Client, path string,
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/octet-stream")
 	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
 	return hc.Do(req)
 }
 
@@ -1983,8 +2309,12 @@ type deny struct {
 // текстом (см. denyReply), и это единственное место, где она разбирается.
 func denyReason(code int, body string) (deny, bool) {
 	switch {
+	case strings.Contains(body, denyClock):
+		return deny{"clockskew", "часы устройства сильно расходятся с часами сервера — поправьте время"}, true
 	case code == http.StatusConflict || strings.Contains(body, denyUsed):
 		return deny{"linkused", "ссылка уже используется на другом устройстве — попросите владельца отвязать её или выдать новую"}, true
+	case code == http.StatusNotFound && strings.Contains(body, "page not found"):
+		// сервер маскируется под обычный сайт: «нет доступа» приходит как 404
 	case code != http.StatusForbidden:
 		return deny{}, false
 	case strings.Contains(body, denyUnknown):
@@ -1995,10 +2325,56 @@ func denyReason(code int, body string) (deny, bool) {
 	if linkCred != "" {
 		return deny{"linkbad", "сервер не принял ссылку — возможно, она выпущена для другого сервера"}, true
 	}
-	return deny{"authfail", "неверный мастер-ключ (сервер вернул 403)"}, true
+	return deny{"authfail", "неверный мастер-ключ (сервер вернул 403/404)"}, true
+}
+
+// helloE2E — рукопожатие со сквозным шифрованием вместо пароля в заголовках.
+func (tc *tunnelClient) helloE2E() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	start := time.Now()
+	cs, err := tc.clientKx(ctx)
+	var d kxDeny
+	switch {
+	case errors.As(err, &d):
+		if why, bad := denyReason(http.StatusForbidden, d.reason); bad {
+			fmt.Println("STATUS " + why.status) // машиночитаемо для Android-обёртки
+			return errors.New(why.text)
+		}
+		return d
+	case errors.Is(err, errKx):
+		return fmt.Errorf("%v\n  Если сервер старой версии — обновите его или запустите клиент с -legacy (без шифрования)", err)
+	case err != nil:
+		return err
+	}
+	clientSess.Store(cs)
+	st.rttMs.Store(time.Since(start).Milliseconds())
+	return nil
+}
+
+// rekey пересоздаёт E2E-сессию, когда сервер её забыл (рестарт, простой).
+// Уже открытые стримы при этом теряются — их ключи принадлежали старой сессии.
+func (tc *tunnelClient) rekey() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cs, err := tc.clientKx(ctx)
+	var d kxDeny
+	switch {
+	case err == nil:
+		clientSess.Store(cs)
+		logf("🔑 E2E-сессия пересоздана")
+	case errors.As(err, &d):
+		if why, bad := denyReason(http.StatusForbidden, d.reason); bad {
+			logf("⚠ %s", why.text)
+			fmt.Println("STATUS " + why.status)
+		}
+	}
 }
 
 func (tc *tunnelClient) hello() error {
+	if !clientLegacy && (authToken != "" || linkCred != "") {
+		return tc.helloE2E()
+	}
 	token := randID()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -2038,9 +2414,12 @@ func (tc *tunnelClient) keepWarm() {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			tail := string(b)
-			// Владелец мог удалить или отозвать ссылку уже после подключения:
-			// замечаем это здесь и сообщаем обёртке, чтобы та погасила VPN.
-			if why, bad := denyReason(resp.StatusCode, tail); bad {
+			// Сервер забыл E2E-сессию (рестарт/простой) — договариваемся заново.
+			if clientSess.Load() != nil && resp.StatusCode == http.StatusNotFound {
+				tc.rekey()
+			} else if why, bad := denyReason(resp.StatusCode, tail); bad {
+				// Владелец мог удалить или отозвать ссылку уже после подключения:
+				// замечаем это здесь и сообщаем обёртке, чтобы та погасила VPN.
 				logf("⚠ %s", why.text)
 				fmt.Println("STATUS " + why.status)
 			} else {
@@ -2073,35 +2452,85 @@ func (tc *tunnelClient) bye() {
 func (tc *tunnelClient) connect(hc *http.Client, id, target string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	resp, err := tc.doReq(ctx, hc, "/t/connect", url.Values{"id": {id}}, qTarget, []byte(target))
+	payload := []byte(target)
+	if cs := clientSess.Load(); cs != nil {
+		k := deriveStreamKeys(cs.c2s, cs.s2c, id)
+		tc.keys.Store(id, k)
+		payload = k.connect.Seal(nil, nonceFor(0), payload, []byte("cn|"+id))
+	}
+	resp, err := tc.doReq(ctx, hc, "/t/connect", url.Values{"id": {id}}, qTarget, payload)
 	if err != nil {
+		tc.keys.Delete(id)
 		return err
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		tc.keys.Delete(id)
 		return fmt.Errorf("connect status %d", resp.StatusCode)
 	}
 	return nil
 }
 
+// up отправляет один chunk вверх с ретраями по СЕТЕВОЙ ошибке или 5xx/429:
+// сервер принимает повтор того же seq идемпотентно (handleUp), так что можно
+// смело слать один и тот же шифртекст ещё раз — ничего не задвоится. Ответы
+// вида 400/404/413 — протокольная ошибка (не то соединение/повреждённые
+// данные/лимит), повторять бессмысленно, отдаём её сразу.
 func (tc *tunnelClient) up(hc *http.Client, id string, seq uint64, data []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	q := url.Values{"id": {id}, "seq": {strconv.FormatUint(seq, 10)}}
+	if k := tc.streamKeysFor(id); k != nil {
+		data = k.up.Seal(nil, nonceFor(seq), data, upAAD(id, seq, false))
+	}
+	var lastErr error
+	backoff := 150 * time.Millisecond
+	for attempt := 0; attempt < maxUpRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		resp, err := tc.doReq(ctx, hc, "/t/up", q, qData, data)
+		cancel()
+		if err != nil {
+			lastErr = err
+		} else {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				return fmt.Errorf("up status %d", resp.StatusCode)
+			}
+			lastErr = fmt.Errorf("up status %d", resp.StatusCode)
+		}
+		if attempt < maxUpRetries-1 {
+			time.Sleep(backoff)
+			backoff = minDur(backoff*2, 3*time.Second)
+		}
+	}
+	return lastErr
+}
+
+// upEOF сообщает серверу, что вверх больше ничего не будет: seq — первый
+// НЕиспользованный номер (всё до него уже подтверждено доставленным). Сервер
+// применит его только когда реассемблер дойдёт до этого seq по порядку, так
+// что отправлять можно сразу после того как все чанки поставлены в очередь.
+func (tc *tunnelClient) upEOF(hc *http.Client, id string, seq uint64) {
+	var data []byte
+	if k := tc.streamKeysFor(id); k != nil {
+		data = k.up.Seal(nil, nonceFor(seq), nil, upAAD(id, seq, true))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q := url.Values{"id": {id}, "seq": {strconv.FormatUint(seq, 10)}, "eof": {"1"}}
 	resp, err := tc.doReq(ctx, hc, "/t/up", q, qData, data)
 	if err != nil {
-		return err
+		return // не критично: полное закрытие всё равно придёт по /t/close
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("up status %d", resp.StatusCode)
-	}
-	return nil
 }
 
 func (tc *tunnelClient) closeStream(hc *http.Client, id string) {
+	defer tc.keys.Delete(id)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	resp, err := tc.doReq(ctx, hc, "/t/close", url.Values{"id": {id}}, "", nil)
@@ -2115,16 +2544,14 @@ func (tc *tunnelClient) relay(hc *http.Client, conn net.Conn, br io.Reader, id s
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Вниз: длинный потоковый ответ (одинаково в обоих транспортах).
+	// Вниз: длинный потоковый ответ, сам переподключается и продолжает с той
+	// же позиции при обрыве (см. relayDown в reliability.go) — независимо от
+	// апстрима, поэтому ждём его явно, а не рвём при завершении апстрима.
+	var down sync.WaitGroup
+	down.Add(1)
 	go func() {
-		defer conn.Close()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tc.base+"/t/down?id="+id, nil)
-		resp, err := hc.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-		io.Copy(countWriter{conn, &st.down}, resp.Body)
+		defer down.Done()
+		tc.relayDown(ctx, hc, conn, id)
 	}()
 
 	if clientTransport == "stream" {
@@ -2132,8 +2559,86 @@ func (tc *tunnelClient) relay(hc *http.Client, conn net.Conn, br io.Reader, id s
 	} else {
 		tc.relayUpChunked(hc, br, id)
 	}
+	// Апстрим закончился (приложение больше не пишет) — это НЕ повод рвать
+	// скачивание ответа: ждём, пока сервер/цель сами не закроются или down
+	// не исчерпает лимит переподключений.
+	down.Wait()
 	tc.closeStream(hc, id)
 	cancel()
+	conn.Close()
+}
+
+// relayDown читает ответ сервера вниз, переподключаясь с точной позиции
+// resume при сетевом обрыве (см. dnRing на сервере). Не переподключается,
+// если сервер закрыл поток штатно, если локальный сокет мёртв (незачем — там
+// уже некому получать данные), либо если исчерпан лимит попыток.
+func (tc *tunnelClient) relayDown(ctx context.Context, hc *http.Client, conn net.Conn, id string) {
+	var pos uint64
+	first := true // только самый первый запрос идёт без from (пока нечего резюмировать)
+	fails := 0
+	backoff := 200 * time.Millisecond
+	for fails < maxDownReconnects {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		u := tc.base + "/t/down?id=" + id
+		if !first {
+			// ВАЖНО: pos==0 после неудачной(ых) попытки(ок) без прогресса —
+			// это ЗАКОННАЯ позиция «нужно с самого начала», а не «ничего не
+			// просили». Пропуск from здесь означал бы «дай хвост» и тихо
+			// терял бы уже накопленные в кольце байты.
+			u += "&from=" + strconv.FormatUint(pos, 10)
+		}
+		first = false
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		resp, err := hc.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			fails++
+			time.Sleep(backoff)
+			backoff = minDur(backoff*2, 5*time.Second)
+			continue
+		}
+		if resp.StatusCode == http.StatusGone {
+			resp.Body.Close() // диапазон эвикнут сервером — восполнить нечем
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			fails++
+			time.Sleep(backoff)
+			backoff = minDur(backoff*2, 5*time.Second)
+			continue
+		}
+		fails, backoff = 0, 200*time.Millisecond // соединение установлено — счётчик сбрасываем
+		reader := tc.wrapDown(id, resp.Body)
+		n, copyErr := copyDown(conn, reader)
+		truncated := resp.Trailer.Get(downTruncatedTrailer) != "" // см. handleDown
+		resp.Body.Close()
+		if r, ok := reader.(interface{ Consumed() uint64 }); ok {
+			pos = r.Consumed()
+		} else {
+			pos += n
+		}
+		switch {
+		case copyErr == errLocalClosed:
+			return // локальному приложению уже некуда писать
+		case copyErr == nil && !truncated:
+			return // сервер закрыл поток штатно (цель закрылась) — данных больше не будет
+		case ctx.Err() != nil:
+			return
+		}
+		fails++
+		time.Sleep(backoff)
+		backoff = minDur(backoff*2, 5*time.Second)
+	}
 }
 
 // relayUpStream — апстрим одним длинным POST: тело запроса читается прямо из
@@ -2141,7 +2646,7 @@ func (tc *tunnelClient) relay(hc *http.Client, conn net.Conn, br io.Reader, id s
 // Требует CDN, пропускающего streaming request body (иначе сервер не увидит
 // байты до закрытия — используйте transport=chunked).
 func (tc *tunnelClient) relayUpStream(ctx context.Context, hc *http.Client, br io.Reader, id string) {
-	body := io.NopCloser(&countReader{r: br, c: &st.up})
+	body := io.NopCloser(tc.wrapUp(id, &countReader{r: br, c: &st.up}))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tc.base+"/t/ups?id="+id, body)
 	if err != nil {
 		return
@@ -2180,7 +2685,7 @@ func (tc *tunnelClient) streamWorks() bool {
 		}
 		defer resp.Body.Close()
 		b := make([]byte, 1)
-		n, _ := resp.Body.Read(b)
+		n, _ := tc.wrapDown(id, resp.Body).Read(b)
 		gotDown <- n > 0
 	}()
 
@@ -2190,7 +2695,7 @@ func (tc *tunnelClient) streamWorks() bool {
 		<-ctx.Done()
 		pw.Close()
 	}()
-	upReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, tc.base+"/t/ups?id="+id, pr)
+	upReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, tc.base+"/t/ups?id="+id, io.NopCloser(tc.wrapUp(id, pr)))
 	upReq.Header.Set("Content-Type", "application/octet-stream")
 	go func() {
 		if resp, err := hc.Do(upReq); err == nil {
@@ -2242,6 +2747,12 @@ func (tc *tunnelClient) relayUpChunked(hc *http.Client, br io.Reader, id string)
 		}
 	}
 	wg.Wait()
+	if !upErr.Load() {
+		// Чисто дочитали локальный ввод до EOF — говорим серверу, что вверх
+		// больше ничего не будет (он полу-закроет запись в цель), но само
+		// скачивание ответа при этом не трогаем (см. relayDown).
+		tc.upEOF(hc, id, seq)
+	}
 }
 
 // ============================ SOCKS5 ============================
@@ -2353,6 +2864,9 @@ func (tc *tunnelClient) handleSocks(conn net.Conn) {
 func (tc *tunnelClient) udpOpen(hc *http.Client, id string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if cs := clientSess.Load(); cs != nil {
+		tc.ukeys.Store(id, &udpClientKeys{keys: deriveUDPKeys(cs.c2s, cs.s2c, id)})
+	}
 	resp, err := tc.doReq(ctx, hc, "/u/open", url.Values{"id": {id}}, "", nil)
 	if err != nil {
 		return err
@@ -2368,6 +2882,13 @@ func (tc *tunnelClient) udpOpen(hc *http.Client, id string) error {
 func (tc *tunnelClient) udpSend(hc *http.Client, id string, frame []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if v, ok := tc.ukeys.Load(id); ok {
+		uk := v.(*udpClientKeys)
+		ctr := uk.ctr.Add(1) - 1
+		out := make([]byte, 8, 8+len(frame)+16)
+		binary.BigEndian.PutUint64(out, ctr)
+		frame = uk.keys.up.Seal(out, nonceFor(ctr), frame, []byte("uu|"+id))
+	}
 	resp, err := tc.doReq(ctx, hc, "/u/send", url.Values{"id": {id}}, qData, frame)
 	if err != nil {
 		return
@@ -2377,6 +2898,7 @@ func (tc *tunnelClient) udpSend(hc *http.Client, id string, frame []byte) {
 }
 
 func (tc *tunnelClient) udpClose(hc *http.Client, id string) {
+	defer tc.ukeys.Delete(id)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	resp, err := tc.doReq(ctx, hc, "/u/close", url.Values{"id": {id}}, "", nil)
@@ -2418,22 +2940,26 @@ func (tc *tunnelClient) handleUDPAssociate(conn net.Conn, hc *http.Client) {
 			return
 		}
 		defer resp.Body.Close()
+		var body io.Reader = resp.Body
+		if v, ok := tc.ukeys.Load(id); ok {
+			body = newOpenReader(resp.Body, v.(*udpClientKeys).keys.down, "ud|"+id)
+		}
 		h := make([]byte, 2)
 		for {
-			if _, err := io.ReadFull(resp.Body, h); err != nil {
+			if _, err := io.ReadFull(body, h); err != nil {
 				return
 			}
 			al := binary.BigEndian.Uint16(h)
 			addr := make([]byte, al)
-			if _, err := io.ReadFull(resp.Body, addr); err != nil {
+			if _, err := io.ReadFull(body, addr); err != nil {
 				return
 			}
-			if _, err := io.ReadFull(resp.Body, h); err != nil {
+			if _, err := io.ReadFull(body, h); err != nil {
 				return
 			}
 			dl := binary.BigEndian.Uint16(h)
 			data := make([]byte, dl)
-			if _, err := io.ReadFull(resp.Body, data); err != nil {
+			if _, err := io.ReadFull(body, data); err != nil {
 				return
 			}
 			if aa := appAddr.Load(); aa != nil {
