@@ -1,0 +1,60 @@
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index 821b8ac..5c0d89c 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -2,12 +2,54 @@ plugins {
+     id 'com.android.application'
+ }
+ 
++// build-go.sh — обычный bash-скрипт, а на Windows своего bash в системе нет
++// по умолчанию (даже если Git for Windows стоит: его bin/ не обязательно в
++// PATH). Ищем bash.exe сами, вместо того чтобы полагаться на PATH.
++def resolveBashExecutable() {
++    if (!org.gradle.internal.os.OperatingSystem.current().isWindows()) {
++        return 'bash'
++    }
++    def candidates = []
++    try {
++        def out = ['where', 'git'].execute().text.trim()
++        def gitExe = out ? out.readLines().find { it } : null
++        if (gitExe) {
++            def gitBinOrCmd = new File(gitExe).parentFile // .../Git/cmd или .../Git/bin — bash.exe лежит в .../Git/bin
++            def gitRoot = gitBinOrCmd.parentFile
++            candidates << new File(gitRoot, 'bin/bash.exe').absolutePath
++            candidates << new File(gitBinOrCmd, 'bash.exe').absolutePath
++        }
++    } catch (Exception ignored) {
++        // 'where' не нашёл git или упал — не страшно, есть запасные пути ниже
++    }
++    ['ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'].each { envVar ->
++        def base = System.getenv(envVar)
++        if (base) {
++            candidates << "${base}\\Git\\bin\\bash.exe"
++            candidates << "${base}\\Programs\\Git\\bin\\bash.exe"
++        }
++    }
++    candidates << "${System.getProperty('user.home')}\\AppData\\Local\\Programs\\Git\\bin\\bash.exe"
++
++    def found = candidates.find { it && new File(it).exists() }
++    return found ?: 'bash'
++}
++
+ // Go-часть собирается перед APK: серверный бинарь из assets/ уезжает на VPS
+ // автодеплоем, и он обязан соответствовать текущему main.go — иначе сервер
+ // отвечает «unknown action» на ручки, которых в нём ещё нет.
++def bashExecutable = resolveBashExecutable()
+ tasks.register('buildGoBinaries', Exec) {
+     workingDir rootProject.projectDir
+-    commandLine 'bash', "${rootProject.projectDir}/build-go.sh"
++    doFirst {
++        logger.lifecycle("buildGoBinaries: bash = ${bashExecutable}")
++        if (bashExecutable == 'bash' && org.gradle.internal.os.OperatingSystem.current().isWindows()) {
++            logger.warn("buildGoBinaries: не нашёл bash.exe рядом с Git автоматически — пробую 'bash' из PATH. " +
++                    "Если сборка упадёт с 'Cannot run program \"bash\"' — значит, у вас нестандартная установка Git; " +
++                    "напишите, где стоит git.exe (where.exe git), подправим путь.")
++        }
++    }
++    commandLine bashExecutable, "${rootProject.projectDir}/build-go.sh"
+     inputs.file "${rootProject.projectDir}/../main.go"
+     outputs.files(
+             "${projectDir}/src/main/assets/server/cdn-tunnel-amd64",
