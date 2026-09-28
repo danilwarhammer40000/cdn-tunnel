@@ -22,12 +22,14 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-if [ -z "$sdk" ] && [ -f "$root/local.properties" ]; then
-  # AGP всегда пишет local.properties с sdk.dir — резервный источник, если
-  # переменные окружения почему-то не долетели до задачи Gradle.
-  sdk="$(sed -n 's/^sdk\.dir=//p' "$root/local.properties" | tail -1 | tr -d '\r' | sed 's/\\\\/\//g; s/\\:/:/g')"
+if [ -z "$sdk" ] && [ -f "$here/local.properties" ]; then
+  # Android Studio при синхронизации пишет android/local.properties с sdk.dir —
+  # резервный источник, если переменные окружения не долетели до задачи Gradle.
+  # В файле путь экранирован по правилам .properties: C\:\\Users\\... -> C:/Users/...
+  sdk="$(sed -n 's/^sdk\.dir=//p' "$here/local.properties" | tail -1 | tr -d '\r' | sed 's/\\\\/\//g; s/\\:/:/g')"
 fi
 sdk="${sdk:-$HOME/Android/Sdk}"
+sdk="${sdk//\\//}"   # обратные слэши Windows -> прямые, иначе не сработает glob ниже
 
 cc=""
 for host in linux-x86_64 darwin-x86_64 windows-x86_64; do
