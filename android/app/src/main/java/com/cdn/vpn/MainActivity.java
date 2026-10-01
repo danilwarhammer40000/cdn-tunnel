@@ -11,6 +11,8 @@ import android.graphics.Color;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.LinearLayout;
@@ -32,6 +34,10 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
 
     private static final int REQ_VPN = 1001;
     private static final int REQ_NOTIF = 1002;
+
+    private TextView tvUptime;
+    private final Handler uptimeHandler = new Handler(Looper.getMainLooper());
+    private final Runnable uptimeTick = this::tickUptime;
 
     private TextInputEditText etIp, etHost, etPassword, etPort, etConns, etDns, etMtu;
     private TextInputEditText etLink;
@@ -76,6 +82,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
         btnClear = findViewById(R.id.btn_clear);
         tvStatus = findViewById(R.id.tv_status);
         tvStatusDetail = findViewById(R.id.tv_status_detail);
+        tvUptime = findViewById(R.id.tv_uptime);
         tvConn = findViewById(R.id.tv_conn);
         tvLog = findViewById(R.id.tv_log);
         progress = findViewById(R.id.progress);
