@@ -1,0 +1,52 @@
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index 5c0d89c..94d0f46 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -42,6 +42,24 @@ def bashExecutable = resolveBashExecutable()
+ tasks.register('buildGoBinaries', Exec) {
+     workingDir rootProject.projectDir
+     doFirst {
++        // Путь к Android SDK — прямо из Gradle-проекта (local.properties пишет сама
++        // Android Studio), чтобы build-go.sh не гадал, где искать NDK.
++        def sdkDir = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
++        if (!sdkDir) {
++            def lp = new File(rootProject.projectDir, 'local.properties')
++            if (lp.exists()) {
++                def props = new Properties()
++                lp.withInputStream { props.load(it) }
++                sdkDir = props.getProperty('sdk.dir')
++            }
++        }
++        if (!sdkDir && System.getenv('LOCALAPPDATA')) {
++            sdkDir = System.getenv('LOCALAPPDATA') + '\\Android\\Sdk' // стандартное место Android Studio на Windows
++        }
++        if (sdkDir) {
++            environment 'ANDROID_HOME', sdkDir.replace('\\', '/')
++            logger.lifecycle("buildGoBinaries: Android SDK = ${sdkDir}")
++        }
+         logger.lifecycle("buildGoBinaries: bash = ${bashExecutable}")
+         if (bashExecutable == 'bash' && org.gradle.internal.os.OperatingSystem.current().isWindows()) {
+             logger.warn("buildGoBinaries: не нашёл bash.exe рядом с Git автоматически — пробую 'bash' из PATH. " +
+diff --git a/android/build-go.sh b/android/build-go.sh
+index eca16ca..76c9b23 100755
+--- a/android/build-go.sh
++++ b/android/build-go.sh
+@@ -22,12 +22,14 @@ if ! command -v go >/dev/null 2>&1; then
+ fi
+ 
+ sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+-if [ -z "$sdk" ] && [ -f "$root/local.properties" ]; then
+-  # AGP всегда пишет local.properties с sdk.dir — резервный источник, если
+-  # переменные окружения почему-то не долетели до задачи Gradle.
+-  sdk="$(sed -n 's/^sdk\.dir=//p' "$root/local.properties" | tail -1 | tr -d '\r' | sed 's/\\\\/\//g; s/\\:/:/g')"
++if [ -z "$sdk" ] && [ -f "$here/local.properties" ]; then
++  # Android Studio при синхронизации пишет android/local.properties с sdk.dir —
++  # резервный источник, если переменные окружения не долетели до задачи Gradle.
++  # В файле путь экранирован по правилам .properties: C\:\\Users\\... -> C:/Users/...
++  sdk="$(sed -n 's/^sdk\.dir=//p' "$here/local.properties" | tail -1 | tr -d '\r' | sed 's/\\\\/\//g; s/\\:/:/g')"
+ fi
+ sdk="${sdk:-$HOME/Android/Sdk}"
++sdk="${sdk//\\//}"   # обратные слэши Windows -> прямые, иначе не сработает glob ниже
+ 
+ cc=""
+ for host in linux-x86_64 darwin-x86_64 windows-x86_64; do

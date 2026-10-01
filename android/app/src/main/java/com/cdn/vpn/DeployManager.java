@@ -173,7 +173,7 @@ public class DeployManager {
 
         StringBuilder u = new StringBuilder();
         u.append("[Unit]\n")
-         .append("Description=CDN Tunnel (server)\n")
+         .append("Description=TT.Transport VPN (server)\n")
          .append("After=network-online.target\n")
          .append("Wants=network-online.target\n\n")
          .append("[Service]\n")

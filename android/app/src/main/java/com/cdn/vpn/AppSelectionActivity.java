@@ -1,12 +1,17 @@
 package com.cdn.vpn;
 
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.drawable.Drawable;
+import android.net.VpnService;
 import android.os.AsyncTask;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -47,9 +52,15 @@ public class AppSelectionActivity extends AppCompatActivity {
         Drawable icon;
     }
 
+    private static final int REQ_VPN_RECONNECT = 4210;
+    /** Задержка между «стоп» и «старт» при переподключении — иначе новый TUN
+     * может попытаться подняться раньше, чем старый успел освободить порт. */
+    private static final long RECONNECT_DELAY_MS = 600;
+
     private MaterialButtonToggleGroup group;
     private MaterialButton btnAll, btnOnly, btnExcept;
     private TextView tvHint;
+    private TextView tvCount;
     private View searchBox;
     private EditText etSearch;
     private ListView list;
@@ -59,6 +70,12 @@ public class AppSelectionActivity extends AppCompatActivity {
     private AppSelectionStore.Mode mode = AppSelectionStore.Mode.ALL;
     private final Set<String> selected = new HashSet<>();
     private List<AppEntry> all = new ArrayList<>();
+
+    // Чтобы понять, нужно ли вообще предлагать переподключиться: сравниваем
+    // с тем, что было при открытии экрана, а не просто «список непустой».
+    private AppSelectionStore.Mode initialMode;
+    private final Set<String> initialSelected = new HashSet<>();
+    private boolean wasRunningOnOpen;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -71,6 +88,7 @@ public class AppSelectionActivity extends AppCompatActivity {
         btnOnly = findViewById(R.id.btn_mode_only);
         btnExcept = findViewById(R.id.btn_mode_except);
         tvHint = findViewById(R.id.tv_mode_hint);
+        tvCount = findViewById(R.id.tv_count);
         searchBox = findViewById(R.id.til_search);
         etSearch = findViewById(R.id.et_search);
         list = findViewById(R.id.list_apps);
@@ -79,6 +97,9 @@ public class AppSelectionActivity extends AppCompatActivity {
         AppSelectionStore store = AppSelectionStore.load(this);
         mode = store.mode;
         selected.addAll(store.packages);
+        initialMode = mode;
+        initialSelected.addAll(store.packages);
+        wasRunningOnOpen = TunState.isRunning();
 
         group.addOnButtonCheckedListener((g, checkedId, isChecked) -> {
             if (!isChecked) return;
@@ -98,6 +119,7 @@ public class AppSelectionActivity extends AppCompatActivity {
             if (selected.contains(e.pkg)) selected.remove(e.pkg); else selected.add(e.pkg);
             CheckBox cb = v.findViewById(R.id.cb_app);
             if (cb != null) cb.setChecked(selected.contains(e.pkg));
+            updateCount();
         });
         etSearch.addTextChangedListener(new android.text.TextWatcher() {
             public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
@@ -117,6 +139,89 @@ public class AppSelectionActivity extends AppCompatActivity {
         store.save(this);
     }
 
+    private boolean changed() {
+        return mode != initialMode || !selected.equals(initialSelected);
+    }
+
+    @Override
+    public void onBackPressed() {
+        leave();
+    }
+
+    @Override
+    public boolean onSupportNavigateUp() {
+        leave();
+        return true;
+    }
+
+    /** Общая точка выхода с экрана — и для системной «назад», и для стрелки в шапке. */
+    private void leave() {
+        if (changed() && wasRunningOnOpen) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Список приложений изменён")
+                    .setMessage("VPN уже подключён — новый список применится только после переподключения. Переподключить сейчас?")
+                    .setPositiveButton("Переподключить", (d, w) -> reconnect())
+                    .setNegativeButton("Позже", (d, w) -> finish())
+                    .setCancelable(true)
+                    .show();
+        } else {
+            finish();
+        }
+    }
+
+    /** Перезапускает туннель с уже сохранённой конфигурацией, чтобы подхватить
+     * новый список приложений — без возврата на главный экран. */
+    private void reconnect() {
+        Config cfg = Config.load(this);
+        startService(new Intent(this, TunVpnService.class).setAction(TunVpnService.ACTION_STOP));
+        Runnable startAgain = () -> {
+            Intent prep = VpnService.prepare(AppSelectionActivity.this);
+            if (prep != null) {
+                // Разрешение уже должно быть выдано (VPN только что работал), но на
+                // всякий случай — если система вдруг попросит подтвердить заново.
+                startActivityForResult(prep, REQ_VPN_RECONNECT);
+                pendingReconnectConfig = cfg;
+                return;
+            }
+            doStart(cfg);
+            finish();
+        };
+        new Handler(Looper.getMainLooper()).postDelayed(startAgain, RECONNECT_DELAY_MS);
+    }
+
+    private Config pendingReconnectConfig;
+
+    private void doStart(Config cfg) {
+        Intent i = new Intent(this, TunVpnService.class).setAction(TunVpnService.ACTION_START);
+        cfg.toIntent(i);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i);
+        else startService(i);
+        TunState.setPhase(TunState.STARTING, "переподключение…");
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req == REQ_VPN_RECONNECT) {
+            if (res == RESULT_OK && pendingReconnectConfig != null) {
+                doStart(pendingReconnectConfig);
+            } else {
+                Toast.makeText(this, "Переподключение отменено — примените список вручную кнопкой в приложении", Toast.LENGTH_LONG).show();
+            }
+            pendingReconnectConfig = null;
+            finish();
+        }
+    }
+
+    private void updateCount() {
+        if (mode == AppSelectionStore.Mode.ALL) {
+            tvCount.setVisibility(View.GONE);
+            return;
+        }
+        tvCount.setVisibility(View.VISIBLE);
+        tvCount.setText("Выбрано: " + selected.size());
+    }
+
     private void checkModeButton() {
         int id = mode == AppSelectionStore.Mode.ONLY ? R.id.btn_mode_only
                 : mode == AppSelectionStore.Mode.EXCEPT ? R.id.btn_mode_except : R.id.btn_mode_all;
@@ -127,6 +232,7 @@ public class AppSelectionActivity extends AppCompatActivity {
         boolean pick = mode != AppSelectionStore.Mode.ALL;
         list.setVisibility(pick ? View.VISIBLE : View.GONE);
         searchBox.setVisibility(pick ? View.VISIBLE : View.GONE);
+        updateCount();
         switch (mode) {
             case ONLY:
                 tvHint.setText("Через туннель пойдут только отмеченные приложения. Остальные будут работать через обычный интернет, в обход VPN.");

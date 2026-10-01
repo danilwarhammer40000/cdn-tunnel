@@ -1839,15 +1839,19 @@ func (t *tunnelServer) handleDown(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Trailer", downTruncatedTrailer) // редкий пост-200 gone — см. ниже
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	for {
 		data, end, gone, closed, wait := s.dn.poll(pos)
 		if gone {
-			// Заголовки уже ушли, статус не поменять — говорим клиенту трейлером,
-			// чтобы он не принял обрыв за штатный конец потока и продолжил ретраи.
-			w.Header().Set(downTruncatedTrailer, "1")
+			// Заголовки уже ушли (200), статус не поменять. Раньше здесь ставился
+			// HTTP-трейлер (X-Cdn-Truncated), чтобы клиент не принял обрыв за
+			// штатный конец потока, — но на практике комбинация «долгий chunked
+			// h2-ответ + трейлер» ловила протокольные ошибки h2 у Cloudflare
+			// («received DATA after END_STREAM») в Chrome/Chromium-клиентах.
+			// Смысла трейлера это не отменяет (это by design самый редкий путь:
+			// клиент отстал больше буфера), но безопаснее для реальных CDN просто
+			// закрыть тело — клиент увидит чистый EOF и решит, что цель закрылась.
 			return
 		}
 		if len(data) > 0 {
@@ -2620,7 +2624,6 @@ func (tc *tunnelClient) relayDown(ctx context.Context, hc *http.Client, conn net
 		fails, backoff = 0, 200*time.Millisecond // соединение установлено — счётчик сбрасываем
 		reader := tc.wrapDown(id, resp.Body)
 		n, copyErr := copyDown(conn, reader)
-		truncated := resp.Trailer.Get(downTruncatedTrailer) != "" // см. handleDown
 		resp.Body.Close()
 		if r, ok := reader.(interface{ Consumed() uint64 }); ok {
 			pos = r.Consumed()
@@ -2630,7 +2633,7 @@ func (tc *tunnelClient) relayDown(ctx context.Context, hc *http.Client, conn net
 		switch {
 		case copyErr == errLocalClosed:
 			return // локальному приложению уже некуда писать
-		case copyErr == nil && !truncated:
+		case copyErr == nil:
 			return // сервер закрыл поток штатно (цель закрылась) — данных больше не будет
 		case ctx.Err() != nil:
 			return

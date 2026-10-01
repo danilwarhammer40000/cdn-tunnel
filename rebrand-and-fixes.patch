@@ -1,0 +1,715 @@
+diff --git a/android/README.md b/android/README.md
+index 3817877..1e5e8d8 100644
+--- a/android/README.md
++++ b/android/README.md
+@@ -1,4 +1,4 @@
+-# CDN Tunnel — Android-обёртка
++# TT.Transport VPN — Android-обёртка
+ 
+ VPN-приложение, которое заворачивает **весь трафик телефона** через туннель из
+ `../main.go` (режим `-client`): SOCKS5 → HTTP/2 через CDN → ваш `-server`.
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 9d74b50..1422fcd 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -22,7 +22,7 @@
+         android:roundIcon="@mipmap/ic_launcher_round"
+         android:supportsRtl="true"
+         android:extractNativeLibs="true"
+-        android:theme="@style/Theme.CDNTunnel">
++        android:theme="@style/Theme.TTTransportVPN">
+ 
+         <activity
+             android:name=".MainActivity"
+diff --git a/android/app/src/main/java/com/cdn/vpn/AdminActivity.java b/android/app/src/main/java/com/cdn/vpn/AdminActivity.java
+index 445ab13..7d1df50 100644
+--- a/android/app/src/main/java/com/cdn/vpn/AdminActivity.java
++++ b/android/app/src/main/java/com/cdn/vpn/AdminActivity.java
+@@ -162,13 +162,13 @@ public class AdminActivity extends AppCompatActivity {
+         TextView state = v.findViewById(R.id.tv_link_state);
+         title.setText(label.isEmpty() ? "Без подписи" : label);
+         if (revoked) {
+-            state.setText("отозвана"); state.setTextColor(0xFFD0674A);
++            state.setText("отозвана"); state.setTextColor(0xFFF87171);
+         } else if (online) {
+-            state.setText("на линии"); state.setTextColor(0xFF9FB86A);
++            state.setText("на линии"); state.setTextColor(0xFF38BDF8);
+         } else if (device.isEmpty()) {
+-            state.setText("не использована"); state.setTextColor(0xFFC7A34E);
++            state.setText("не использована"); state.setTextColor(0xFF93C5FD);
+         } else {
+-            state.setText("привязана"); state.setTextColor(0xFF8A7A66);
++            state.setText("привязана"); state.setTextColor(0xFF64748B);
+         }
+ 
+         // Подпись меняется по нажатию на неё: у ссылок, перенесённых со старого
+@@ -384,7 +384,7 @@ public class AdminActivity extends AppCompatActivity {
+         TextView v = new TextView(this);
+         v.setText(text);
+         v.setTextSize(12);
+-        v.setTextColor(0xFFB9A588);
++        v.setTextColor(0xFFCBD5E1);
+         v.setPadding(dp(2), dp(4), 0, dp(8));
+         return v;
+     }
+diff --git a/android/app/src/main/java/com/cdn/vpn/AppSelectionActivity.java b/android/app/src/main/java/com/cdn/vpn/AppSelectionActivity.java
+index 4587b78..4444e60 100644
+--- a/android/app/src/main/java/com/cdn/vpn/AppSelectionActivity.java
++++ b/android/app/src/main/java/com/cdn/vpn/AppSelectionActivity.java
+@@ -1,12 +1,17 @@
+ package com.cdn.vpn;
+ 
++import android.app.AlertDialog;
+ import android.content.Intent;
+ import android.content.pm.ApplicationInfo;
+ import android.content.pm.PackageManager;
+ import android.content.pm.ResolveInfo;
+ import android.graphics.drawable.Drawable;
++import android.net.VpnService;
+ import android.os.AsyncTask;
++import android.os.Build;
+ import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
+@@ -47,9 +52,15 @@ public class AppSelectionActivity extends AppCompatActivity {
+         Drawable icon;
+     }
+ 
++    private static final int REQ_VPN_RECONNECT = 4210;
++    /** Задержка между «стоп» и «старт» при переподключении — иначе новый TUN
++     * может попытаться подняться раньше, чем старый успел освободить порт. */
++    private static final long RECONNECT_DELAY_MS = 600;
++
+     private MaterialButtonToggleGroup group;
+     private MaterialButton btnAll, btnOnly, btnExcept;
+     private TextView tvHint;
++    private TextView tvCount;
+     private View searchBox;
+     private EditText etSearch;
+     private ListView list;
+@@ -60,6 +71,12 @@ public class AppSelectionActivity extends AppCompatActivity {
+     private final Set<String> selected = new HashSet<>();
+     private List<AppEntry> all = new ArrayList<>();
+ 
++    // Чтобы понять, нужно ли вообще предлагать переподключиться: сравниваем
++    // с тем, что было при открытии экрана, а не просто «список непустой».
++    private AppSelectionStore.Mode initialMode;
++    private final Set<String> initialSelected = new HashSet<>();
++    private boolean wasRunningOnOpen;
++
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
+@@ -71,6 +88,7 @@ public class AppSelectionActivity extends AppCompatActivity {
+         btnOnly = findViewById(R.id.btn_mode_only);
+         btnExcept = findViewById(R.id.btn_mode_except);
+         tvHint = findViewById(R.id.tv_mode_hint);
++        tvCount = findViewById(R.id.tv_count);
+         searchBox = findViewById(R.id.til_search);
+         etSearch = findViewById(R.id.et_search);
+         list = findViewById(R.id.list_apps);
+@@ -79,6 +97,9 @@ public class AppSelectionActivity extends AppCompatActivity {
+         AppSelectionStore store = AppSelectionStore.load(this);
+         mode = store.mode;
+         selected.addAll(store.packages);
++        initialMode = mode;
++        initialSelected.addAll(store.packages);
++        wasRunningOnOpen = TunState.isRunning();
+ 
+         group.addOnButtonCheckedListener((g, checkedId, isChecked) -> {
+             if (!isChecked) return;
+@@ -98,6 +119,7 @@ public class AppSelectionActivity extends AppCompatActivity {
+             if (selected.contains(e.pkg)) selected.remove(e.pkg); else selected.add(e.pkg);
+             CheckBox cb = v.findViewById(R.id.cb_app);
+             if (cb != null) cb.setChecked(selected.contains(e.pkg));
++            updateCount();
+         });
+         etSearch.addTextChangedListener(new android.text.TextWatcher() {
+             public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+@@ -117,6 +139,89 @@ public class AppSelectionActivity extends AppCompatActivity {
+         store.save(this);
+     }
+ 
++    private boolean changed() {
++        return mode != initialMode || !selected.equals(initialSelected);
++    }
++
++    @Override
++    public void onBackPressed() {
++        leave();
++    }
++
++    @Override
++    public boolean onSupportNavigateUp() {
++        leave();
++        return true;
++    }
++
++    /** Общая точка выхода с экрана — и для системной «назад», и для стрелки в шапке. */
++    private void leave() {
++        if (changed() && wasRunningOnOpen) {
++            new AlertDialog.Builder(this)
++                    .setTitle("Список приложений изменён")
++                    .setMessage("VPN уже подключён — новый список применится только после переподключения. Переподключить сейчас?")
++                    .setPositiveButton("Переподключить", (d, w) -> reconnect())
++                    .setNegativeButton("Позже", (d, w) -> finish())
++                    .setCancelable(true)
++                    .show();
++        } else {
++            finish();
++        }
++    }
++
++    /** Перезапускает туннель с уже сохранённой конфигурацией, чтобы подхватить
++     * новый список приложений — без возврата на главный экран. */
++    private void reconnect() {
++        Config cfg = Config.load(this);
++        startService(new Intent(this, TunVpnService.class).setAction(TunVpnService.ACTION_STOP));
++        Runnable startAgain = () -> {
++            Intent prep = VpnService.prepare(AppSelectionActivity.this);
++            if (prep != null) {
++                // Разрешение уже должно быть выдано (VPN только что работал), но на
++                // всякий случай — если система вдруг попросит подтвердить заново.
++                startActivityForResult(prep, REQ_VPN_RECONNECT);
++                pendingReconnectConfig = cfg;
++                return;
++            }
++            doStart(cfg);
++            finish();
++        };
++        new Handler(Looper.getMainLooper()).postDelayed(startAgain, RECONNECT_DELAY_MS);
++    }
++
++    private Config pendingReconnectConfig;
++
++    private void doStart(Config cfg) {
++        Intent i = new Intent(this, TunVpnService.class).setAction(TunVpnService.ACTION_START);
++        cfg.toIntent(i);
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i);
++        else startService(i);
++        TunState.setPhase(TunState.STARTING, "переподключение…");
++    }
++
++    @Override
++    protected void onActivityResult(int req, int res, Intent data) {
++        super.onActivityResult(req, res, data);
++        if (req == REQ_VPN_RECONNECT) {
++            if (res == RESULT_OK && pendingReconnectConfig != null) {
++                doStart(pendingReconnectConfig);
++            } else {
++                Toast.makeText(this, "Переподключение отменено — примените список вручную кнопкой в приложении", Toast.LENGTH_LONG).show();
++            }
++            pendingReconnectConfig = null;
++            finish();
++        }
++    }
++
++    private void updateCount() {
++        if (mode == AppSelectionStore.Mode.ALL) {
++            tvCount.setVisibility(View.GONE);
++            return;
++        }
++        tvCount.setVisibility(View.VISIBLE);
++        tvCount.setText("Выбрано: " + selected.size());
++    }
++
+     private void checkModeButton() {
+         int id = mode == AppSelectionStore.Mode.ONLY ? R.id.btn_mode_only
+                 : mode == AppSelectionStore.Mode.EXCEPT ? R.id.btn_mode_except : R.id.btn_mode_all;
+@@ -127,6 +232,7 @@ public class AppSelectionActivity extends AppCompatActivity {
+         boolean pick = mode != AppSelectionStore.Mode.ALL;
+         list.setVisibility(pick ? View.VISIBLE : View.GONE);
+         searchBox.setVisibility(pick ? View.VISIBLE : View.GONE);
++        updateCount();
+         switch (mode) {
+             case ONLY:
+                 tvHint.setText("Через туннель пойдут только отмеченные приложения. Остальные будут работать через обычный интернет, в обход VPN.");
+diff --git a/android/app/src/main/java/com/cdn/vpn/DeployManager.java b/android/app/src/main/java/com/cdn/vpn/DeployManager.java
+index 0d1ffb4..30450a5 100644
+--- a/android/app/src/main/java/com/cdn/vpn/DeployManager.java
++++ b/android/app/src/main/java/com/cdn/vpn/DeployManager.java
+@@ -173,7 +173,7 @@ public class DeployManager {
+ 
+         StringBuilder u = new StringBuilder();
+         u.append("[Unit]\n")
+-         .append("Description=CDN Tunnel (server)\n")
++         .append("Description=TT.Transport VPN (server)\n")
+          .append("After=network-online.target\n")
+          .append("Wants=network-online.target\n\n")
+          .append("[Service]\n")
+diff --git a/android/app/src/main/java/com/cdn/vpn/MainActivity.java b/android/app/src/main/java/com/cdn/vpn/MainActivity.java
+index e5e3a70..75becb0 100644
+--- a/android/app/src/main/java/com/cdn/vpn/MainActivity.java
++++ b/android/app/src/main/java/com/cdn/vpn/MainActivity.java
+@@ -172,6 +172,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
+     @Override protected void onPause() {
+         super.onPause();
+         TunState.setListener(null);
++        uptimeHandler.removeCallbacks(uptimeTick); // не тикаем впустую, пока экран не виден
+         save(); // persist fields whenever the user leaves the screen
+     }
+ 
+@@ -501,17 +502,17 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
+     @Override public void onPhase(String phase, String detail) {
+         String label; int color;
+         switch (phase) {
+-            case TunState.CONNECTED:    label = "Подключено";       color = 0xFF9FB86A; break;
+-            case TunState.CONNECTING:   label = "Подключение…";     color = 0xFFC7A34E; break;
+-            case TunState.STARTING:     label = "Запуск…";          color = 0xFFC7A34E; break;
+-            case TunState.NO_ROUTE:     label = "Нет маршрута";     color = 0xFFD0674A; break;
+-            case TunState.AUTH_FAIL:    label = "Неверный ключ";    color = 0xFFD0674A; break;
+-            case TunState.ERROR:        label = "Ошибка";           color = 0xFFD0674A; break;
+-            case TunState.LINK_USED:    label = "Ссылка занята";    color = 0xFFD0674A; break;
+-            case TunState.LINK_REVOKED: label = "Ссылка отозвана";  color = 0xFFD0674A; break;
+-            case TunState.LINK_GONE:    label = "Ссылки больше нет"; color = 0xFFD0674A; break;
+-            case TunState.LINK_BAD:     label = "Ссылка не принята"; color = 0xFFD0674A; break;
+-            default:                    label = "Отключено";        color = 0xFFB9A588; break;
++            case TunState.CONNECTED:    label = "Подключено";       color = 0xFF38BDF8; break;
++            case TunState.CONNECTING:   label = "Подключение…";     color = 0xFF93C5FD; break;
++            case TunState.STARTING:     label = "Запуск…";          color = 0xFF93C5FD; break;
++            case TunState.NO_ROUTE:     label = "Нет маршрута";     color = 0xFFF87171; break;
++            case TunState.AUTH_FAIL:    label = "Неверный ключ";    color = 0xFFF87171; break;
++            case TunState.ERROR:        label = "Ошибка";           color = 0xFFF87171; break;
++            case TunState.LINK_USED:    label = "Ссылка занята";    color = 0xFFF87171; break;
++            case TunState.LINK_REVOKED: label = "Ссылка отозвана";  color = 0xFFF87171; break;
++            case TunState.LINK_GONE:    label = "Ссылки больше нет"; color = 0xFFF87171; break;
++            case TunState.LINK_BAD:     label = "Ссылка не принята"; color = 0xFFF87171; break;
++            default:                    label = "Отключено";        color = 0xFFCBD5E1; break;
+         }
+         tvStatus.setText(label);
+         tvStatus.setTextColor(color);
+@@ -523,6 +524,28 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
+         boolean busy = phase.equals(TunState.STARTING) || phase.equals(TunState.CONNECTING);
+         progress.setVisibility(busy ? View.VISIBLE : View.GONE);
+         onRunningChanged(TunState.isRunning());
++
++        uptimeHandler.removeCallbacks(uptimeTick);
++        if (TunState.CONNECTED.equals(phase)) {
++            uptimeHandler.post(uptimeTick); // сразу покажет текущее значение, дальше тикает раз в секунду
++        } else {
++            tvUptime.setVisibility(View.GONE);
++        }
++    }
++
++    /** Секундомер «сколько подключены» — источник истины в TunState.connectedSince(),
++     * поэтому переживает поворот экрана и пересоздание активности. */
++    private void tickUptime() {
++        long since = TunState.connectedSince();
++        if (since <= 0) {
++            tvUptime.setVisibility(View.GONE);
++            return;
++        }
++        long sec = (System.currentTimeMillis() - since) / 1000;
++        long h = sec / 3600, m = (sec % 3600) / 60, s = sec % 60;
++        tvUptime.setVisibility(View.VISIBLE);
++        tvUptime.setText(String.format(java.util.Locale.ROOT, "Подключено: %02d:%02d:%02d", h, m, s));
++        uptimeHandler.postDelayed(uptimeTick, 1000);
+     }
+ 
+     @Override public void onStats(TunState.Stats s) {
+diff --git a/android/app/src/main/java/com/cdn/vpn/TunState.java b/android/app/src/main/java/com/cdn/vpn/TunState.java
+index 189d5ef..0a58214 100644
+--- a/android/app/src/main/java/com/cdn/vpn/TunState.java
++++ b/android/app/src/main/java/com/cdn/vpn/TunState.java
+@@ -48,6 +48,10 @@ public final class TunState {
+     private static volatile boolean running = false;
+     private static volatile String phase = DISCONNECTED;
+     private static volatile String phaseDetail = "";
++    /** Момент, когда последний раз стали CONNECTED (0 — сейчас не подключены).
++     * Хранится здесь, а не в Activity, чтобы пережить поворот экрана и
++     * пересоздание UI — секундомер не сбрасывается на пустом месте. */
++    private static volatile long connectedSince = 0;
+     private static volatile Stats stats = new Stats();
+     private static volatile Listener listener;
+ 
+@@ -56,6 +60,8 @@ public final class TunState {
+     public static boolean isRunning() { return running; }
+     public static String phase() { return phase; }
+     public static String phaseDetail() { return phaseDetail; }
++    /** 0, если сейчас не в фазе CONNECTED. */
++    public static long connectedSince() { return connectedSince; }
+     public static Stats stats() { return stats; }
+ 
+     public static void setListener(Listener l) { listener = l; }
+@@ -71,6 +77,11 @@ public final class TunState {
+     }
+ 
+     public static void setPhase(final String p, final String detail) {
++        if (CONNECTED.equals(p)) {
++            if (!CONNECTED.equals(phase)) connectedSince = System.currentTimeMillis();
++        } else {
++            connectedSince = 0;
++        }
+         phase = p;
+         phaseDetail = detail == null ? "" : detail;
+         final Listener l = listener;
+diff --git a/android/app/src/main/java/com/cdn/vpn/TunVpnService.java b/android/app/src/main/java/com/cdn/vpn/TunVpnService.java
+index a34b1ec..9ff6900 100644
+--- a/android/app/src/main/java/com/cdn/vpn/TunVpnService.java
++++ b/android/app/src/main/java/com/cdn/vpn/TunVpnService.java
+@@ -106,7 +106,7 @@ public class TunVpnService extends VpnService {
+             if (stopping) return;
+ 
+             Builder b = new Builder();
+-            b.setSession("CDN Tunnel");
++            b.setSession("TT.Transport VPN");
+             b.setMtu(cfg.mtu);
+             b.addAddress("10.0.0.2", 32);
+             b.addRoute("0.0.0.0", 0);
+@@ -473,7 +473,7 @@ public class TunVpnService extends VpnService {
+         NotificationManager nm = getSystemService(NotificationManager.class);
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+             NotificationChannel ch = new NotificationChannel(
+-                    CHANNEL, "CDN Tunnel", NotificationManager.IMPORTANCE_LOW);
++                    CHANNEL, "TT.Transport VPN", NotificationManager.IMPORTANCE_LOW);
+             ch.setDescription("Статус VPN-туннеля");
+             nm.createNotificationChannel(ch);
+         }
+@@ -484,7 +484,7 @@ public class TunVpnService extends VpnService {
+         PendingIntent stopPi = PendingIntent.getService(this, 1, stop, PendingIntent.FLAG_IMMUTABLE);
+ 
+         Notification n = new Notification.Builder(this, CHANNEL)
+-                .setContentTitle("CDN Tunnel")
++                .setContentTitle("TT.Transport VPN")
+                 .setContentText("Туннель активен — нажмите, чтобы открыть, или Стоп")
+                 .setSmallIcon(R.drawable.ic_launcher_foreground)
+                 .setContentIntent(pi)
+diff --git a/android/app/src/main/res/drawable/card_bg.xml b/android/app/src/main/res/drawable/card_bg.xml
+index dcef6fa..6f67901 100644
+--- a/android/app/src/main/res/drawable/card_bg.xml
++++ b/android/app/src/main/res/drawable/card_bg.xml
+@@ -3,5 +3,5 @@
+     android:shape="rectangle">
+     <solid android:color="@color/surface" />
+     <corners android:radius="16dp" />
+-    <stroke android:width="1dp" android:color="#332A1C" />
++    <stroke android:width="1dp" android:color="@color/outline" />
+ </shape>
+diff --git a/android/app/src/main/res/drawable/ic_launcher_background.xml b/android/app/src/main/res/drawable/ic_launcher_background.xml
+index 18b494d..845cb85 100644
+--- a/android/app/src/main/res/drawable/ic_launcher_background.xml
++++ b/android/app/src/main/res/drawable/ic_launcher_background.xml
+@@ -4,6 +4,6 @@
+     android:height="108dp"
+     android:viewportWidth="108"
+     android:viewportHeight="108">
+-    <path android:fillColor="#5B4EE6" android:pathData="M0,0h108v108h-108z" />
+-    <path android:fillColor="#6A5CF0" android:pathData="M0,0L108,0L108,108Z" />
++    <path android:fillColor="#1E3A8A" android:pathData="M0,0h108v108h-108z" />
++    <path android:fillColor="#0EA5FF" android:pathData="M0,0L108,0L108,108Z" />
+ </vector>
+diff --git a/android/app/src/main/res/drawable/ic_launcher_foreground.xml b/android/app/src/main/res/drawable/ic_launcher_foreground.xml
+index 30e02ca..c195919 100644
+--- a/android/app/src/main/res/drawable/ic_launcher_foreground.xml
++++ b/android/app/src/main/res/drawable/ic_launcher_foreground.xml
+@@ -10,6 +10,6 @@
+         android:pathData="M54,26 L78,36 L78,54 C78,68 68,78 54,84 C40,78 30,68 30,54 L30,36 Z" />
+     <!-- tunnel arrow -->
+     <path
+-        android:fillColor="#5B4EE6"
++        android:fillColor="#0EA5FF"
+         android:pathData="M44,50 L60,50 L60,44 L70,54 L60,64 L60,58 L44,58 Z" />
+ </vector>
+diff --git a/android/app/src/main/res/layout/activity_app_selection.xml b/android/app/src/main/res/layout/activity_app_selection.xml
+index b1b9f4f..99479eb 100644
+--- a/android/app/src/main/res/layout/activity_app_selection.xml
++++ b/android/app/src/main/res/layout/activity_app_selection.xml
+@@ -1,6 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+     android:orientation="vertical"
+@@ -17,22 +18,31 @@
+             android:id="@+id/btn_mode_all"
+             style="@style/Widget.Material3.Button.OutlinedButton"
+             android:layout_width="0dp" android:layout_height="wrap_content"
+-            android:layout_weight="1"
++            android:layout_weight="1" android:minHeight="52dp"
++            android:maxLines="2" android:textSize="11sp"
++            android:paddingStart="2dp" android:paddingEnd="2dp"
++            android:insetTop="4dp" android:insetBottom="4dp"
+             android:text="Все" />
+ 
+         <com.google.android.material.button.MaterialButton
+             android:id="@+id/btn_mode_only"
+             style="@style/Widget.Material3.Button.OutlinedButton"
+             android:layout_width="0dp" android:layout_height="wrap_content"
+-            android:layout_weight="1"
+-            android:text="Только выбранные" />
++            android:layout_weight="1" android:minHeight="52dp"
++            android:maxLines="2" android:textSize="11sp"
++            android:paddingStart="2dp" android:paddingEnd="2dp"
++            android:insetTop="4dp" android:insetBottom="4dp"
++            android:text="Только\nвыбранные" />
+ 
+         <com.google.android.material.button.MaterialButton
+             android:id="@+id/btn_mode_except"
+             style="@style/Widget.Material3.Button.OutlinedButton"
+             android:layout_width="0dp" android:layout_height="wrap_content"
+-            android:layout_weight="1"
+-            android:text="Кроме выбранных" />
++            android:layout_weight="1" android:minHeight="52dp"
++            android:maxLines="2" android:textSize="11sp"
++            android:paddingStart="2dp" android:paddingEnd="2dp"
++            android:insetTop="4dp" android:insetBottom="4dp"
++            android:text="Кроме\nвыбранных" />
+     </com.google.android.material.button.MaterialButtonToggleGroup>
+ 
+     <TextView
+@@ -43,6 +53,16 @@
+         android:textColor="?attr/colorOnSurfaceVariant"
+         android:text="Через туннель идёт весь трафик устройства." />
+ 
++    <TextView
++        android:id="@+id/tv_count"
++        android:layout_width="match_parent" android:layout_height="wrap_content"
++        android:layout_marginTop="4dp"
++        android:textSize="13sp"
++        android:textStyle="bold"
++        android:textColor="?attr/colorPrimary"
++        android:visibility="gone"
++        tools:text="Выбрано: 3" />
++
+     <com.google.android.material.textfield.TextInputLayout
+         android:id="@+id/til_search"
+         android:layout_width="match_parent" android:layout_height="wrap_content"
+diff --git a/android/app/src/main/res/layout/activity_main.xml b/android/app/src/main/res/layout/activity_main.xml
+index 0321b90..a8073ad 100644
+--- a/android/app/src/main/res/layout/activity_main.xml
++++ b/android/app/src/main/res/layout/activity_main.xml
+@@ -1,6 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+     android:orientation="vertical">
+@@ -63,6 +64,14 @@
+                         android:textSize="13sp"
+                         android:paddingTop="2dp"
+                         android:textColor="?attr/colorOnSurfaceVariant" />
++                    <TextView
++                        android:id="@+id/tv_uptime"
++                        android:layout_width="match_parent" android:layout_height="wrap_content"
++                        android:textSize="13sp" android:fontFamily="monospace"
++                        android:paddingTop="4dp"
++                        android:textColor="?attr/colorPrimary"
++                        android:visibility="gone"
++                        tools:text="Подключено: 00:04:12" />
+                     <com.google.android.material.progressindicator.LinearProgressIndicator
+                         android:id="@+id/progress"
+                         android:layout_width="match_parent" android:layout_height="wrap_content"
+@@ -115,6 +124,15 @@
+                     android:text="Приложения в туннеле: все"
+                     app:icon="@drawable/ic_tab_link" app:cornerRadius="14dp" />
+ 
++
++                <com.google.android.material.button.MaterialButton
++                    android:id="@+id/btn_toggle"
++                    android:layout_width="match_parent" android:layout_height="56dp"
++                    android:layout_marginTop="18dp"
++                    android:text="Запустить VPN"
++                    android:textSize="16sp" android:textStyle="bold"
++                    app:cornerRadius="14dp" />
++
+                 <!-- Ручная настройка (свёрнута: обычно хватает ссылки) -->
+                 <LinearLayout
+                     android:id="@+id/hdr_manual"
+@@ -339,14 +357,6 @@
+ 
+                 </LinearLayout><!-- /box_manual -->
+ 
+-                <com.google.android.material.button.MaterialButton
+-                    android:id="@+id/btn_toggle"
+-                    android:layout_width="match_parent" android:layout_height="56dp"
+-                    android:layout_marginTop="18dp"
+-                    android:text="Запустить VPN"
+-                    android:textSize="16sp" android:textStyle="bold"
+-                    app:cornerRadius="14dp" />
+-
+             </LinearLayout>
+         </androidx.core.widget.NestedScrollView>
+ 
+diff --git a/android/app/src/main/res/values/colors.xml b/android/app/src/main/res/values/colors.xml
+index fa42ab5..44c4438 100644
+--- a/android/app/src/main/res/values/colors.xml
++++ b/android/app/src/main/res/values/colors.xml
+@@ -1,16 +1,18 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <!-- Тёплая коричневая палитра -->
+-    <color name="bg">#120D08</color>
+-    <color name="surface">#1E160E</color>
+-    <color name="surface2">#281E13</color>
+-    <color name="clay">#C7764E</color>
+-    <color name="clay_dim">#8A5A3C</color>
+-    <color name="amber">#B0824F</color>
+-    <color name="cream">#EBDCC9</color>
+-    <color name="cream_dim">#B9A588</color>
+-    <color name="danger">#D0674A</color>
+-    <color name="ok">#9FB86A</color>
+-    <color name="down">#C7A34E</color>
+-    <color name="up">#C7764E</color>
++    <!-- Тёмно-синяя палитра (INCY-style) -->
++    <color name="bg">#0A0F14</color>
++    <color name="surface">#111A24</color>
++    <color name="surface2">#1B2633</color>
++    <color name="outline">#2A3A4A</color>
++    <color name="disabled">#3B4B5C</color>
++    <color name="clay">#0EA5FF</color>
++    <color name="clay_dim">#1E3A8A</color>
++    <color name="amber">#38BDF8</color>
++    <color name="cream">#F8FAFC</color>
++    <color name="cream_dim">#CBD5E1</color>
++    <color name="danger">#F87171</color>
++    <color name="ok">#38BDF8</color>
++    <color name="down">#0EA5FF</color>
++    <color name="up">#38BDF8</color>
+ </resources>
+diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
+index 0e9200b..5ca128b 100644
+--- a/android/app/src/main/res/values/strings.xml
++++ b/android/app/src/main/res/values/strings.xml
+@@ -1,3 +1,3 @@
+ <resources>
+-    <string name="app_name">CDN Tunnel</string>
++    <string name="app_name">TT.Transport VPN</string>
+ </resources>
+diff --git a/android/app/src/main/res/values/themes.xml b/android/app/src/main/res/values/themes.xml
+index 4e0c1e8..8aeb941 100644
+--- a/android/app/src/main/res/values/themes.xml
++++ b/android/app/src/main/res/values/themes.xml
+@@ -1,17 +1,17 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <style name="Theme.CDNTunnel" parent="Theme.Material3.Dark.NoActionBar">
++    <style name="Theme.TTTransportVPN" parent="Theme.Material3.Dark.NoActionBar">
+         <item name="colorPrimary">@color/clay</item>
+-        <item name="colorOnPrimary">#160F09</item>
+-        <item name="colorPrimaryContainer">#3A2A1C</item>
+-        <item name="colorOnPrimaryContainer">@color/cream</item>
++        <item name="colorOnPrimary">#04141F</item>
++        <item name="colorPrimaryContainer">@color/clay_dim</item>
++        <item name="colorOnPrimaryContainer">#93C5FD</item>
+         <item name="colorSecondary">@color/amber</item>
+         <item name="android:colorBackground">@color/bg</item>
+         <item name="colorSurface">@color/surface</item>
+         <item name="colorSurfaceVariant">@color/surface2</item>
+         <item name="colorOnSurface">@color/cream</item>
+         <item name="colorOnSurfaceVariant">@color/cream_dim</item>
+-        <item name="colorOutline">#4A3A28</item>
++        <item name="colorOutline">@color/outline</item>
+         <item name="android:windowBackground">@color/bg</item>
+         <item name="android:statusBarColor">@color/bg</item>
+         <item name="android:navigationBarColor">@color/bg</item>
+diff --git a/main.go b/main.go
+index aaab89b..3fca8d1 100644
+--- a/main.go
++++ b/main.go
+@@ -1839,15 +1839,19 @@ func (t *tunnelServer) handleDown(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	w.Header().Set("Content-Type", "application/octet-stream")
+ 	w.Header().Set("X-Accel-Buffering", "no")
+-	w.Header().Set("Trailer", downTruncatedTrailer) // редкий пост-200 gone — см. ниже
+ 	w.WriteHeader(http.StatusOK)
+ 	flusher.Flush()
+ 	for {
+ 		data, end, gone, closed, wait := s.dn.poll(pos)
+ 		if gone {
+-			// Заголовки уже ушли, статус не поменять — говорим клиенту трейлером,
+-			// чтобы он не принял обрыв за штатный конец потока и продолжил ретраи.
+-			w.Header().Set(downTruncatedTrailer, "1")
++			// Заголовки уже ушли (200), статус не поменять. Раньше здесь ставился
++			// HTTP-трейлер (X-Cdn-Truncated), чтобы клиент не принял обрыв за
++			// штатный конец потока, — но на практике комбинация «долгий chunked
++			// h2-ответ + трейлер» ловила протокольные ошибки h2 у Cloudflare
++			// («received DATA after END_STREAM») в Chrome/Chromium-клиентах.
++			// Смысла трейлера это не отменяет (это by design самый редкий путь:
++			// клиент отстал больше буфера), но безопаснее для реальных CDN просто
++			// закрыть тело — клиент увидит чистый EOF и решит, что цель закрылась.
+ 			return
+ 		}
+ 		if len(data) > 0 {
+@@ -2620,7 +2624,6 @@ func (tc *tunnelClient) relayDown(ctx context.Context, hc *http.Client, conn net
+ 		fails, backoff = 0, 200*time.Millisecond // соединение установлено — счётчик сбрасываем
+ 		reader := tc.wrapDown(id, resp.Body)
+ 		n, copyErr := copyDown(conn, reader)
+-		truncated := resp.Trailer.Get(downTruncatedTrailer) != "" // см. handleDown
+ 		resp.Body.Close()
+ 		if r, ok := reader.(interface{ Consumed() uint64 }); ok {
+ 			pos = r.Consumed()
+@@ -2630,7 +2633,7 @@ func (tc *tunnelClient) relayDown(ctx context.Context, hc *http.Client, conn net
+ 		switch {
+ 		case copyErr == errLocalClosed:
+ 			return // локальному приложению уже некуда писать
+-		case copyErr == nil && !truncated:
++		case copyErr == nil:
+ 			return // сервер закрыл поток штатно (цель закрылась) — данных больше не будет
+ 		case ctx.Err() != nil:
+ 			return
+diff --git a/reliability.go b/reliability.go
+index d543b5c..366347b 100644
+--- a/reliability.go
++++ b/reliability.go
+@@ -33,14 +33,6 @@ var (
+ 	maxUpRetries      = 4 // сколько раз клиент повторяет один и тот же chunk вверх
+ )
+ 
+-const (
+-	// downTruncatedTrailer — HTTP-трейлер: сервер эвиктнул часть данных уже
+-	// ПОСЛЕ того, как отправил 200 (редкий путь — клиент сильно отстал).
+-	// Статус к этому моменту не поменять, поэтому сигналим трейлером: иначе
+-	// клиент видел бы чистый io.EOF и принял обрыв за штатный конец потока.
+-	downTruncatedTrailer = "X-Cdn-Truncated"
+-)
+-
+ // dnRing — буфер последних отправленных вниз байт с абсолютными смещениями.
+ // Позволяет клиенту после обрыва GET попросить "/t/down?from=<offset>" и
+ // получить то, что он не успел дочитать, не начиная стрим заново. Каждый
+diff --git a/reliability_test.go b/reliability_test.go
+index 977161a..1254484 100644
+--- a/reliability_test.go
++++ b/reliability_test.go
+@@ -215,7 +215,14 @@ func TestHandleDownBadFrom(t *testing.T) {
+ 	}
+ }
+ 
+-func TestHandleDownTruncationTrailer(t *testing.T) {
++// Пост-200 эвикция — редкий путь (клиент отстал от кольца больше буфера).
++// Раньше сервер сигналил об этом HTTP-трейлером, но на практике комбинация
++// «долгий chunked h2-ответ + трейлер» провоцировала протокольные ошибки h2 у
++// Cloudflare в Chrome/Chromium («received DATA after END_STREAM»). Теперь
++// сервер просто закрывает тело — клиент видит чистый EOF, как при штатном
++// закрытии цели (это осознанный компромисс: реже теряем воображаемые байты
++// в этом редком случае, зато не ломаем h2 у реальных CDN).
++func TestHandleDownTruncationClosesCleanly(t *testing.T) {
+ 	t.Cleanup(resetReliabilityGlobals)
+ 	maxDownRingBytes = 10
+ 	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
+@@ -235,8 +242,7 @@ func TestHandleDownTruncationTrailer(t *testing.T) {
+ 	if resp.StatusCode != http.StatusOK {
+ 		t.Fatalf("status=%d, ожидался 200", resp.StatusCode)
+ 	}
+-	// Пока хендлер ждёт продолжения, эвиктим всё вытеснением — это должно
+-	// закрыть тело с трейлером, а не просто чисто оборваться.
++	// Пока хендлер ждёт продолжения, эвиктим всё вытеснением.
+ 	go func() {
+ 		time.Sleep(100 * time.Millisecond)
+ 		s.dn.append(bytes.Repeat([]byte("Z"), 20)) // вытесняет "hi" и ещё сверху — pos=2 гарантированно попадает в вытесненное
+@@ -248,9 +254,6 @@ func TestHandleDownTruncationTrailer(t *testing.T) {
+ 	if string(got) != "hi" {
+ 		t.Fatalf("тело=%q, ожидалось \"hi\"", got)
+ 	}
+-	if resp.Trailer.Get(downTruncatedTrailer) == "" {
+-		t.Fatal("ожидался трейлер об обрезанном потоке — клиент не должен принять это за штатный конец")
+-	}
+ }
+ 
+ // ---------------------------------------------------------------- клиентский relayDown/up

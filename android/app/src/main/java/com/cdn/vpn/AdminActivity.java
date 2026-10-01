@@ -162,13 +162,13 @@ public class AdminActivity extends AppCompatActivity {
         TextView state = v.findViewById(R.id.tv_link_state);
         title.setText(label.isEmpty() ? "Без подписи" : label);
         if (revoked) {
-            state.setText("отозвана"); state.setTextColor(0xFFD0674A);
+            state.setText("отозвана"); state.setTextColor(0xFFF87171);
         } else if (online) {
-            state.setText("на линии"); state.setTextColor(0xFF9FB86A);
+            state.setText("на линии"); state.setTextColor(0xFF38BDF8);
         } else if (device.isEmpty()) {
-            state.setText("не использована"); state.setTextColor(0xFFC7A34E);
+            state.setText("не использована"); state.setTextColor(0xFF93C5FD);
         } else {
-            state.setText("привязана"); state.setTextColor(0xFF8A7A66);
+            state.setText("привязана"); state.setTextColor(0xFF64748B);
         }
 
         // Подпись меняется по нажатию на неё: у ссылок, перенесённых со старого
@@ -384,7 +384,7 @@ public class AdminActivity extends AppCompatActivity {
         TextView v = new TextView(this);
         v.setText(text);
         v.setTextSize(12);
-        v.setTextColor(0xFFB9A588);
+        v.setTextColor(0xFFCBD5E1);
         v.setPadding(dp(2), dp(4), 0, dp(8));
         return v;
     }

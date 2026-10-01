@@ -22,7 +22,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:extractNativeLibs="true"
-        android:theme="@style/Theme.CDNTunnel">
+        android:theme="@style/Theme.TTTransportVPN">
 
         <activity
             android:name=".MainActivity"

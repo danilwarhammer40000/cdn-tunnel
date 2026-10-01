@@ -48,6 +48,10 @@ public final class TunState {
     private static volatile boolean running = false;
     private static volatile String phase = DISCONNECTED;
     private static volatile String phaseDetail = "";
+    /** Момент, когда последний раз стали CONNECTED (0 — сейчас не подключены).
+     * Хранится здесь, а не в Activity, чтобы пережить поворот экрана и
+     * пересоздание UI — секундомер не сбрасывается на пустом месте. */
+    private static volatile long connectedSince = 0;
     private static volatile Stats stats = new Stats();
     private static volatile Listener listener;
 
@@ -56,6 +60,8 @@ public final class TunState {
     public static boolean isRunning() { return running; }
     public static String phase() { return phase; }
     public static String phaseDetail() { return phaseDetail; }
+    /** 0, если сейчас не в фазе CONNECTED. */
+    public static long connectedSince() { return connectedSince; }
     public static Stats stats() { return stats; }
 
     public static void setListener(Listener l) { listener = l; }
@@ -71,6 +77,11 @@ public final class TunState {
     }
 
     public static void setPhase(final String p, final String detail) {
+        if (CONNECTED.equals(p)) {
+            if (!CONNECTED.equals(phase)) connectedSince = System.currentTimeMillis();
+        } else {
+            connectedSince = 0;
+        }
         phase = p;
         phaseDetail = detail == null ? "" : detail;
         final Listener l = listener;

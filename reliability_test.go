@@ -215,7 +215,14 @@ func TestHandleDownBadFrom(t *testing.T) {
 	}
 }
 
-func TestHandleDownTruncationTrailer(t *testing.T) {
+// Пост-200 эвикция — редкий путь (клиент отстал от кольца больше буфера).
+// Раньше сервер сигналил об этом HTTP-трейлером, но на практике комбинация
+// «долгий chunked h2-ответ + трейлер» провоцировала протокольные ошибки h2 у
+// Cloudflare в Chrome/Chromium («received DATA after END_STREAM»). Теперь
+// сервер просто закрывает тело — клиент видит чистый EOF, как при штатном
+// закрытии цели (это осознанный компромисс: реже теряем воображаемые байты
+// в этом редком случае, зато не ломаем h2 у реальных CDN).
+func TestHandleDownTruncationClosesCleanly(t *testing.T) {
 	t.Cleanup(resetReliabilityGlobals)
 	maxDownRingBytes = 10
 	ts := &tunnelServer{streams: map[string]*stream{}, udp: map[string]*udpSession{}}
@@ -235,8 +242,7 @@ func TestHandleDownTruncationTrailer(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, ожидался 200", resp.StatusCode)
 	}
-	// Пока хендлер ждёт продолжения, эвиктим всё вытеснением — это должно
-	// закрыть тело с трейлером, а не просто чисто оборваться.
+	// Пока хендлер ждёт продолжения, эвиктим всё вытеснением.
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		s.dn.append(bytes.Repeat([]byte("Z"), 20)) // вытесняет "hi" и ещё сверху — pos=2 гарантированно попадает в вытесненное
@@ -247,9 +253,6 @@ func TestHandleDownTruncationTrailer(t *testing.T) {
 	}
 	if string(got) != "hi" {
 		t.Fatalf("тело=%q, ожидалось \"hi\"", got)
-	}
-	if resp.Trailer.Get(downTruncatedTrailer) == "" {
-		t.Fatal("ожидался трейлер об обрезанном потоке — клиент не должен принять это за штатный конец")
 	}
 }
 

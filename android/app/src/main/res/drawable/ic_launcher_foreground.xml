@@ -10,6 +10,6 @@
         android:pathData="M54,26 L78,36 L78,54 C78,68 68,78 54,84 C40,78 30,68 30,54 L30,36 Z" />
     <!-- tunnel arrow -->
     <path
-        android:fillColor="#5B4EE6"
+        android:fillColor="#0EA5FF"
         android:pathData="M44,50 L60,50 L60,44 L70,54 L60,64 L60,58 L44,58 Z" />
 </vector>

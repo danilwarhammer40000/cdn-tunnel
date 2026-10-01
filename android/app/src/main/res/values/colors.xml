@@ -1,16 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Тёплая коричневая палитра -->
-    <color name="bg">#120D08</color>
-    <color name="surface">#1E160E</color>
-    <color name="surface2">#281E13</color>
-    <color name="clay">#C7764E</color>
-    <color name="clay_dim">#8A5A3C</color>
-    <color name="amber">#B0824F</color>
-    <color name="cream">#EBDCC9</color>
-    <color name="cream_dim">#B9A588</color>
-    <color name="danger">#D0674A</color>
-    <color name="ok">#9FB86A</color>
-    <color name="down">#C7A34E</color>
-    <color name="up">#C7764E</color>
+    <!-- Тёмно-синяя палитра (INCY-style) -->
+    <color name="bg">#0A0F14</color>
+    <color name="surface">#111A24</color>
+    <color name="surface2">#1B2633</color>
+    <color name="outline">#2A3A4A</color>
+    <color name="disabled">#3B4B5C</color>
+    <color name="clay">#0EA5FF</color>
+    <color name="clay_dim">#1E3A8A</color>
+    <color name="amber">#38BDF8</color>
+    <color name="cream">#F8FAFC</color>
+    <color name="cream_dim">#CBD5E1</color>
+    <color name="danger">#F87171</color>
+    <color name="ok">#38BDF8</color>
+    <color name="down">#0EA5FF</color>
+    <color name="up">#38BDF8</color>
 </resources>

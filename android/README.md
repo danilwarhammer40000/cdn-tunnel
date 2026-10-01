@@ -1,4 +1,4 @@
-# CDN Tunnel — Android-обёртка
+# TT.Transport VPN — Android-обёртка
 
 VPN-приложение, которое заворачивает **весь трафик телефона** через туннель из
 `../main.go` (режим `-client`): SOCKS5 → HTTP/2 через CDN → ваш `-server`.

@@ -172,6 +172,7 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
     @Override protected void onPause() {
         super.onPause();
         TunState.setListener(null);
+        uptimeHandler.removeCallbacks(uptimeTick); // не тикаем впустую, пока экран не виден
         save(); // persist fields whenever the user leaves the screen
     }
 
@@ -501,17 +502,17 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
     @Override public void onPhase(String phase, String detail) {
         String label; int color;
         switch (phase) {
-            case TunState.CONNECTED:    label = "Подключено";       color = 0xFF9FB86A; break;
-            case TunState.CONNECTING:   label = "Подключение…";     color = 0xFFC7A34E; break;
-            case TunState.STARTING:     label = "Запуск…";          color = 0xFFC7A34E; break;
-            case TunState.NO_ROUTE:     label = "Нет маршрута";     color = 0xFFD0674A; break;
-            case TunState.AUTH_FAIL:    label = "Неверный ключ";    color = 0xFFD0674A; break;
-            case TunState.ERROR:        label = "Ошибка";           color = 0xFFD0674A; break;
-            case TunState.LINK_USED:    label = "Ссылка занята";    color = 0xFFD0674A; break;
-            case TunState.LINK_REVOKED: label = "Ссылка отозвана";  color = 0xFFD0674A; break;
-            case TunState.LINK_GONE:    label = "Ссылки больше нет"; color = 0xFFD0674A; break;
-            case TunState.LINK_BAD:     label = "Ссылка не принята"; color = 0xFFD0674A; break;
-            default:                    label = "Отключено";        color = 0xFFB9A588; break;
+            case TunState.CONNECTED:    label = "Подключено";       color = 0xFF38BDF8; break;
+            case TunState.CONNECTING:   label = "Подключение…";     color = 0xFF93C5FD; break;
+            case TunState.STARTING:     label = "Запуск…";          color = 0xFF93C5FD; break;
+            case TunState.NO_ROUTE:     label = "Нет маршрута";     color = 0xFFF87171; break;
+            case TunState.AUTH_FAIL:    label = "Неверный ключ";    color = 0xFFF87171; break;
+            case TunState.ERROR:        label = "Ошибка";           color = 0xFFF87171; break;
+            case TunState.LINK_USED:    label = "Ссылка занята";    color = 0xFFF87171; break;
+            case TunState.LINK_REVOKED: label = "Ссылка отозвана";  color = 0xFFF87171; break;
+            case TunState.LINK_GONE:    label = "Ссылки больше нет"; color = 0xFFF87171; break;
+            case TunState.LINK_BAD:     label = "Ссылка не принята"; color = 0xFFF87171; break;
+            default:                    label = "Отключено";        color = 0xFFCBD5E1; break;
         }
         tvStatus.setText(label);
         tvStatus.setTextColor(color);
@@ -523,6 +524,28 @@ public class MainActivity extends AppCompatActivity implements TunState.Listener
         boolean busy = phase.equals(TunState.STARTING) || phase.equals(TunState.CONNECTING);
         progress.setVisibility(busy ? View.VISIBLE : View.GONE);
         onRunningChanged(TunState.isRunning());
+
+        uptimeHandler.removeCallbacks(uptimeTick);
+        if (TunState.CONNECTED.equals(phase)) {
+            uptimeHandler.post(uptimeTick); // сразу покажет текущее значение, дальше тикает раз в секунду
+        } else {
+            tvUptime.setVisibility(View.GONE);
+        }
+    }
+
+    /** Секундомер «сколько подключены» — источник истины в TunState.connectedSince(),
+     * поэтому переживает поворот экрана и пересоздание активности. */
+    private void tickUptime() {
+        long since = TunState.connectedSince();
+        if (since <= 0) {
+            tvUptime.setVisibility(View.GONE);
+            return;
+        }
+        long sec = (System.currentTimeMillis() - since) / 1000;
+        long h = sec / 3600, m = (sec % 3600) / 60, s = sec % 60;
+        tvUptime.setVisibility(View.VISIBLE);
+        tvUptime.setText(String.format(java.util.Locale.ROOT, "Подключено: %02d:%02d:%02d", h, m, s));
+        uptimeHandler.postDelayed(uptimeTick, 1000);
     }
 
     @Override public void onStats(TunState.Stats s) {

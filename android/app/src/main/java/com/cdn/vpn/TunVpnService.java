@@ -106,7 +106,7 @@ public class TunVpnService extends VpnService {
             if (stopping) return;
 
             Builder b = new Builder();
-            b.setSession("CDN Tunnel");
+            b.setSession("TT.Transport VPN");
             b.setMtu(cfg.mtu);
             b.addAddress("10.0.0.2", 32);
             b.addRoute("0.0.0.0", 0);
@@ -473,7 +473,7 @@ public class TunVpnService extends VpnService {
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL, "CDN Tunnel", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL, "TT.Transport VPN", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Статус VPN-туннеля");
             nm.createNotificationChannel(ch);
         }
@@ -484,7 +484,7 @@ public class TunVpnService extends VpnService {
         PendingIntent stopPi = PendingIntent.getService(this, 1, stop, PendingIntent.FLAG_IMMUTABLE);
 
         Notification n = new Notification.Builder(this, CHANNEL)
-                .setContentTitle("CDN Tunnel")
+                .setContentTitle("TT.Transport VPN")
                 .setContentText("Туннель активен — нажмите, чтобы открыть, или Стоп")
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
                 .setContentIntent(pi)

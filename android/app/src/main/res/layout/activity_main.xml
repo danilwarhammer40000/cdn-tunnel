@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical">
@@ -63,6 +64,14 @@
                         android:textSize="13sp"
                         android:paddingTop="2dp"
                         android:textColor="?attr/colorOnSurfaceVariant" />
+                    <TextView
+                        android:id="@+id/tv_uptime"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:textSize="13sp" android:fontFamily="monospace"
+                        android:paddingTop="4dp"
+                        android:textColor="?attr/colorPrimary"
+                        android:visibility="gone"
+                        tools:text="Подключено: 00:04:12" />
                     <com.google.android.material.progressindicator.LinearProgressIndicator
                         android:id="@+id/progress"
                         android:layout_width="match_parent" android:layout_height="wrap_content"
@@ -114,6 +123,15 @@
                     android:layout_marginBottom="10dp"
                     android:text="Приложения в туннеле: все"
                     app:icon="@drawable/ic_tab_link" app:cornerRadius="14dp" />
+
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_toggle"
+                    android:layout_width="match_parent" android:layout_height="56dp"
+                    android:layout_marginTop="18dp"
+                    android:text="Запустить VPN"
+                    android:textSize="16sp" android:textStyle="bold"
+                    app:cornerRadius="14dp" />
 
                 <!-- Ручная настройка (свёрнута: обычно хватает ссылки) -->
                 <LinearLayout
@@ -338,14 +356,6 @@
                     android:text="Стереть все настройки" android:textColor="@color/danger" />
 
                 </LinearLayout><!-- /box_manual -->
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btn_toggle"
-                    android:layout_width="match_parent" android:layout_height="56dp"
-                    android:layout_marginTop="18dp"
-                    android:text="Запустить VPN"
-                    android:textSize="16sp" android:textStyle="bold"
-                    app:cornerRadius="14dp" />
 
             </LinearLayout>
         </androidx.core.widget.NestedScrollView>
